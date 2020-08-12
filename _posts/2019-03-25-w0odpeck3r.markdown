@@ -1,0 +1,127 @@
+---
+layout: post
+title:  "2019.3.25 “啄木鸟”杯网络安全技能大赛writeup"
+tags: [writeup]
+date: 2019-03-25
+comments: false
+---
+# "啄木鸟"杯网络安全技能大赛wp
+
+---
+
+![logo][1]
+
+---
+
+## **RE**
+
+### 1. 简单的汇编语言
+
+**x86asm,直接编译不会通过，因为题目故意将一些地方写错。导致masm报错。**
+有两种方法，第一种，将源文件修改，让它通过编译即可，第二种，观察程序执行过程，写出解题脚本。
+
+###### 1. 方法1
+首先没有定义栈，因此下面的语句是多余的。
+```x86asm
+assume  ss:stack
+        
+    mov bx,stack
+    mov ss,bx
+    mov sp,128
+```
+其次赋值es寄存器的地方有问题:
+```x86asm
+init_Reg:
+    ;mov bx,
+    mov es,0B800H
+```
+改为
+```x86asm
+init_Reg:
+    mov bx,0B800H
+    mov es,bx
+```
+即可。
+最后show_flag被注释掉了，删掉注释符即可。
+```x86asm
+        ;call show_flag
+```
+这样就可以masm编译 link链接 直接执行exe 显示出flag了。win7 64bit以上需要dosbox。
+
+###### 2. 方法2
+
+观察一下程序，关键汇编指令如下:
+```x86asm
+show_flag:
+        mov si,0
+        mov cx,59
+showflag: 
+        mov al,ds:[si]
+        xor al,233
+        mov es:[di],al
+        inc si
+        add di,2
+        loop showflag
+        ret
+```
+循环59次，将ds:[si]中的数据与十进制数字**233**进行异或,结果放到es:[di]中，每次循环偏移地址 si+=1 , di+=2。
+
+```x86asm
+assume cs:code,ds:data,ss:stack
+data segment
+  db 09eH,0d9H,086H,08dH,099H,08cH,08aH,082H
+  db 0daH,09bH,092H,0ddH,0baH,0a4H,0b6H,0d8H
+  db 0baH,0b6H,0acH,0a8H,09aH,09aH,090H,090H
+  db 090H,0b6H,0dfH,08cH,0ddH,0dcH,0d1H,08aH
+  db 0dbH,0dbH,0ddH,0dfH,0dbH,0d1H,0d0H,08bH
+  db 088H,0d9H,0ddH,0d0H,0dcH,08aH,08fH,0dfH
+  db 0d0H,0d9H,0daH,08dH,08fH,08aH,08aH,08fH
+  db 0d8H,0deH,094H
+data ends
+...
+    mov bx,data
+    mov ds,bx
+...
+        mov es,0B800H
+    mov di,160*15 + 20*2
+```
+
+si在上方被置为0,ds被置为data,data segment中正好存着59个16进制数据。虽然语法有错误，大概可以猜测出es被置为0B800H，既dos界面对应显存段地址，在这个段写数据会使其显示在屏幕上。di控制了显示的位置。
+
+因此可得知，就是个简单的异或。将data segment中的所有数据依次与233进行异或，之后将得到的数据写入0B800:160*15+20*2及往后的地址。从而将对应的字符显示在屏幕上。
+
+解题python脚本如下:
+```python
+l = [0x9e,0xd9,0x86,0x8d,0x99,0x8c,0x8a,0x82,0xda,0x9b,0x92,0xdd,0xba,0xa4,0xb6,0xd8,0xba,0xb6,0xac,0xa8,0x9a,0x9a,0x90,0x90,0x90,0xb6,0xdf,0x8c,0xdd,0xdc,0xd1,0x8a,0xdb,0xdb,0xdd,0xdf,0xdb,0xd1,0xd0,0x8b,0x88,0xd9,0xdd,0xd0,0xdc,0x8a,0x8f,0xdf,0xd0,0xd9,0xda,0x8d,0x8f,0x8a,0x8a,0x8f,0xd8,0xde,0x94]
+flag = ""
+for ll in l:
+  flag += chr(ll ^ 233)
+print flag
+
+```
+---
+## **CRYPTO**
+
+### 1. 神秘的字符串
+
+看格式为AES加密。找个 [在线的](http://tool.oschina.net/encrypt) 解了。
+```
+flag{hyk_wty_jshwduynts}
+```
+括号内凯撒密码
+```
+flag{ctf_rot_encryption}
+```
+
+### 2. base?
+先base16解密,然后base32解密,最后base64解密.
+```python
+import base64
+s = "4D523545453553324A42424759574A534F4E3547473354554E464D573253544A4C464D4534334359474A34484759534848465A565136544447424E47555A44494A564C55553232504B3546475554544B4D4E345532325346504248473256544B4A354345434D4B4E4E4A4554495432454E52564532325342504946474D554A3548553D3D3D3D3D3D"
+s = base64.b16decode(s)
+s = base64.b32decode(s)
+s = base64.b64decode(s)
+print s
+```
+
+  [1]: http://47.100.224.203/woodpecker.png
